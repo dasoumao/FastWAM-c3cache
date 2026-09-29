@@ -36,7 +36,7 @@ EVALUATION:
   rand_device: cpu
   tiled: false
   compile_action_infer: true
-  timing_enabled: false
+  timing_enabled: true
   c3cache_enabled: false
   c3cache_start_step: 0
   c3cache_end_step: 6

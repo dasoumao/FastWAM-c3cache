@@ -29,6 +29,7 @@ Examples:
      gpu_id=0
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -41,6 +42,12 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig, OmegaConf
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from fastwam.inference_timing import summarize_inference_timing
+
 POLICY_NAME = "fastwam_policy"
 
 
@@ -146,6 +153,39 @@ def _append_override(overrides: list[str], key: str, value: Any, *, skip_none: b
     overrides.extend([f"--{key}", _format_override_value(value)])
 
 
+def _timing_tag(task_config: str) -> str:
+    return "".join(
+        char if char.isalnum() or char in "_-" else "_" for char in task_config
+    )
+
+
+def _read_timing_records(path: Path) -> list[dict[str, float | int | None]]:
+    if not path.exists():
+        return []
+    records = []
+    for line_number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            item = json.loads(line)
+            infer_s = item["infer_s"]
+            infer_cuda_s = item.get("infer_cuda_s")
+            records.append({
+                "inference_seconds": infer_s,
+                "inference_chunks": 1,
+                "inference_cuda_seconds": infer_cuda_s,
+                "inference_cuda_chunks": 1 if infer_cuda_s is not None else 0,
+            })
+        except (KeyError, TypeError, ValueError) as exc:
+            print(
+                f"Invalid inference timing record at {path}:{line_number}: {exc}; "
+                "timing summary will be unavailable.",
+                file=sys.stderr,
+            )
+            return []
+    return records
+
+
 @hydra.main(version_base="1.3", config_path="../../configs", config_name="sim_robotwin.yaml")
 def main(cfg: DictConfig):
     if cfg.ckpt is None:
@@ -191,6 +231,9 @@ def main(cfg: DictConfig):
         / run_ts
         / str(cfg.EVALUATION.task_name)
     )
+    timing_tag = _timing_tag(str(cfg.EVALUATION.task_config))
+    timing_log = robotwin_eval_base / f"fastwam_inference_timing_{timing_tag}.jsonl"
+    timing_summary_path = robotwin_eval_base / f"fastwam_inference_summary_{timing_tag}.json"
 
     sim_cfg_path = (PROJECT_ROOT / "configs" / "sim_robotwin.yaml").resolve()
     sim_task = HydraConfig.get().runtime.choices.get("task")
@@ -245,6 +288,12 @@ def main(cfg: DictConfig):
     env["CUDA_VISIBLE_DEVICES"] = str(cfg.gpu_id)
     env["PYTHONUNBUFFERED"] = "1"
 
+    # The policy appends per-chunk records. A retry using the same output directory
+    # must start with an empty log so previous chunks cannot enter this run's totals.
+    if cfg.EVALUATION.timing_enabled:
+        robotwin_eval_base.mkdir(parents=True, exist_ok=True)
+        timing_log.write_text("", encoding="utf-8")
+
     with open(log_file, "w", encoding="utf-8") as log_f:
         process = subprocess.Popen(
             cmd,
@@ -265,6 +314,33 @@ def main(cfg: DictConfig):
 
     if return_code != 0:
         raise RuntimeError(f"RoboTwin evaluation failed with return code {return_code}. Log: {log_file}")
+
+    timing_records = (
+        _read_timing_records(timing_log) if cfg.EVALUATION.timing_enabled else []
+    )
+    timing_summary = summarize_inference_timing(timing_records)
+    timing_summary_path.parent.mkdir(parents=True, exist_ok=True)
+    timing_summary_path.write_text(
+        json.dumps({
+            "task_name": str(cfg.EVALUATION.task_name),
+            "task_config": str(cfg.EVALUATION.task_config),
+            **timing_summary,
+        }, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    wall_ms = timing_summary["inference_ms_per_chunk"]
+    cuda_ms = timing_summary["inference_cuda_ms_per_chunk"]
+    print(
+        f"Inference timing: wall={wall_ms:.3f} ms/chunk" if wall_ms is not None
+        else "Inference timing: wall=N/A",
+        end="",
+    )
+    cuda_s = timing_summary["inference_cuda_seconds"]
+    print(
+        f", CUDA={cuda_ms:.3f} ms/chunk ({cuda_s:.3f} s total)"
+        if cuda_ms is not None and cuda_s is not None else ", CUDA=N/A"
+    )
+    print(f"Inference timing summary saved to: {timing_summary_path}")
 
     print(f"Evaluation finished successfully. Log saved to: {log_file}")
     OmegaConf.save(

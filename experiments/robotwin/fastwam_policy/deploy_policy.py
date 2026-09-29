@@ -27,6 +27,7 @@ if str(SRC_ROOT) not in sys.path:
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
+from fastwam.inference_timing import InferenceTimer
 
 logger = logging.getLogger(__name__)
 
@@ -234,7 +235,13 @@ class WorldActionRobotWinPolicy:
         self.pending_actions: deque[np.ndarray] = deque()
         self.episode_count = 0
         self.step_count = 0
-        self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0, "infer_chunks": 0}
+        self._timing_rollout = {
+            "infer_s": 0.0,
+            "infer_cuda_s": 0.0,
+            "sim_s": 0.0,
+            "infer_chunks": 0,
+            "infer_cuda_chunks": 0,
+        }
 
         logger.info(
             "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
@@ -313,20 +320,30 @@ class WorldActionRobotWinPolicy:
                 c3cache_end_step=self.c3cache_end_step,
                 c3cache_refresh_interval=self.c3cache_refresh_interval,
             )
-        infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
-            pred = self.model.infer_action(**infer_kwargs)
+            with InferenceTimer(device=self.model.device, enabled=self.timing_enabled) as timer:
+                pred = self.model.infer_action(**infer_kwargs)
         if self.timing_enabled:
-            infer_s = time.perf_counter() - infer_t0
+            infer_s = timer.wall_seconds
+            infer_cuda_s = timer.cuda_seconds
+            assert infer_s is not None
             self._timing_rollout["infer_s"] += infer_s
             self._timing_rollout["infer_chunks"] += 1
+            if infer_cuda_s is not None:
+                self._timing_rollout["infer_cuda_s"] += infer_cuda_s
+                self._timing_rollout["infer_cuda_chunks"] += 1
             timing_record = {
                 "task_name": self.task_name,
                 "task_config": self.task_config,
                 "episode": self.episode_count,
                 "chunk": self._timing_rollout["infer_chunks"],
                 "infer_s": infer_s,
+                "infer_cuda_s": infer_cuda_s,
                 "cumulative_infer_s": self._timing_rollout["infer_s"],
+                "cumulative_infer_cuda_s": (
+                    self._timing_rollout["infer_cuda_s"] if infer_cuda_s is not None else None
+                ),
+                "cumulative_infer_cuda_chunks": self._timing_rollout["infer_cuda_chunks"],
                 "c3cache": {
                     "enabled": self.c3cache_enabled,
                     "start_step": self.c3cache_start_step,
@@ -381,14 +398,21 @@ class WorldActionRobotWinPolicy:
 
     def reset_timing_rollout(self) -> None:
         self._timing_rollout["infer_s"] = 0.0
+        self._timing_rollout["infer_cuda_s"] = 0.0
         self._timing_rollout["sim_s"] = 0.0
         self._timing_rollout["infer_chunks"] = 0
+        self._timing_rollout["infer_cuda_chunks"] = 0
 
-    def get_timing_rollout(self) -> Dict[str, float | int]:
+    def get_timing_rollout(self) -> Dict[str, float | int | None]:
         return {
             "infer_s": float(self._timing_rollout["infer_s"]),
+            "infer_cuda_s": (
+                float(self._timing_rollout["infer_cuda_s"])
+                if self._timing_rollout["infer_cuda_chunks"] else None
+            ),
             "sim_s": float(self._timing_rollout["sim_s"]),
             "infer_chunks": int(self._timing_rollout["infer_chunks"]),
+            "infer_cuda_chunks": int(self._timing_rollout["infer_cuda_chunks"]),
         }
 
     def reset(self) -> None:
@@ -467,7 +491,7 @@ def get_model(usr_args: Dict[str, Any]):
         usr_args.get("c3cache_refresh_interval", cfg.EVALUATION.get("c3cache_refresh_interval", 4))
     )
     timing_enabled = _parse_bool(
-        usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
+        usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", True))
     )
 
     policy = WorldActionRobotWinPolicy(

@@ -1,8 +1,35 @@
 import os
 import json
 import argparse
+import sys
 from collections import defaultdict
+from pathlib import Path
 import pandas as pd
+
+src_root = Path(__file__).resolve().parents[2] / "src"
+if str(src_root) not in sys.path:
+    sys.path.insert(0, str(src_root))
+
+from fastwam.inference_timing import summarize_inference_timing
+
+
+def format_metric(value, precision=3):
+    return f"{value:.{precision}f}" if value is not None else "N/A"
+
+
+def print_inference_timing(timing):
+    print(
+        "- Inference wall: "
+        f"{format_metric(timing['inference_seconds'])} s, "
+        f"{timing['inference_chunks']} chunks, "
+        f"{format_metric(timing['inference_ms_per_chunk'])} ms/chunk"
+    )
+    print(
+        "- Inference CUDA: "
+        f"{format_metric(timing['inference_cuda_seconds'])} s, "
+        f"{timing['inference_cuda_chunks']} chunks, "
+        f"{format_metric(timing['inference_cuda_ms_per_chunk'])} ms/chunk"
+    )
 
 def format_time(seconds):
     """Format seconds as a human-readable duration string.
@@ -40,12 +67,14 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
         'total_time': 0,
         'max_time': 0,
         'psnr_sum': 0.0,
-        'psnr_count': 0
+        'psnr_count': 0,
+        'timing_records': [],
     })
     
     # Store detailed per-task results
     task_results = {}
     has_psnr_metric = False
+    all_timing_records = []
     
     # Iterate over all suite directories
     for suite in ["libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90"]:
@@ -74,6 +103,8 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
             stats['total_successes'] += result['successes']
             stats['total_time'] += result['duration']
             stats['max_time'] = max(stats['max_time'], result['duration'])
+            stats['timing_records'].append(result)
+            all_timing_records.append(result)
             if 'future_video_psnr_mean' in result:
                 has_psnr_metric = True
                 if result['future_video_psnr_mean'] is not None:
@@ -88,6 +119,7 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
                 'successes': result['successes'],
                 'task_description': result['task_description'] if 'task_description' in result else ''
             }
+            task_result.update(summarize_inference_timing([result]))
             if 'future_video_psnr_mean' in result:
                 task_result['future_video_psnr_mean'] = (
                     float(result['future_video_psnr_mean'])
@@ -111,7 +143,13 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
         'Task Suite': [],
         'Success Rate (%)': [],
         'Average Time (s)': [],
-        'Max Time (s)': []
+        'Max Time (s)': [],
+        'Inference Wall (s)': [],
+        'Inference Wall Chunks': [],
+        'Inference Wall (ms/chunk)': [],
+        'Inference CUDA (s)': [],
+        'Inference CUDA Chunks': [],
+        'Inference CUDA (ms/chunk)': [],
     }
     if has_psnr_metric:
         df_data['Average Future PSNR (dB)'] = []
@@ -121,6 +159,7 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
             success_rate = stats['total_successes'] / stats['total_trials'] * 100
             avg_time = stats['total_time'] / stats['total_tasks']
             max_time = stats['max_time']
+            suite_timing = summarize_inference_timing(stats['timing_records'])
             suite_avg_psnr = None
             if has_psnr_metric:
                 suite_avg_psnr = (
@@ -137,6 +176,7 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
             print(f"- Total time: {format_time(stats['total_time'])}")
             print(f"- Average time per task: {format_time(avg_time)}")
             print(f"- Longest task time: {format_time(max_time)}")
+            print_inference_timing(suite_timing)
             if has_psnr_metric:
                 if suite_avg_psnr is not None:
                     print(f"- Average future-video PSNR: {suite_avg_psnr:.4f} dB")
@@ -148,6 +188,12 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
             df_data['Success Rate (%)'].append(f"{success_rate:.2f}")
             df_data['Average Time (s)'].append(f"{avg_time:.2f}")
             df_data['Max Time (s)'].append(f"{max_time:.2f}")
+            df_data['Inference Wall (s)'].append(format_metric(suite_timing['inference_seconds']))
+            df_data['Inference Wall Chunks'].append(suite_timing['inference_chunks'])
+            df_data['Inference Wall (ms/chunk)'].append(format_metric(suite_timing['inference_ms_per_chunk']))
+            df_data['Inference CUDA (s)'].append(format_metric(suite_timing['inference_cuda_seconds']))
+            df_data['Inference CUDA Chunks'].append(suite_timing['inference_cuda_chunks'])
+            df_data['Inference CUDA (ms/chunk)'].append(format_metric(suite_timing['inference_cuda_ms_per_chunk']))
             if has_psnr_metric:
                 df_data['Average Future PSNR (dB)'].append(
                     f"{suite_avg_psnr:.4f}" if suite_avg_psnr is not None else "N/A"
@@ -160,6 +206,7 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
                 overall_psnr_sum += stats['psnr_sum']
                 overall_psnr_count += stats['psnr_count']
     
+    overall_timing = summarize_inference_timing(all_timing_records)
     if total_suites > 0:
         print("\nOverall statistics:")
         avg_success_rate = total_success_rate/total_suites
@@ -173,6 +220,7 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
         print(f"- Total time: {format_time(total_time)}")
         print(f"- Average time per task: {format_time(avg_task_time)}")
         print(f"- Longest task time: {format_time(max_task_time)}")
+        print_inference_timing(overall_timing)
         if has_psnr_metric:
             if overall_avg_psnr is not None:
                 print(f"- Average future-video PSNR: {overall_avg_psnr:.4f} dB")
@@ -184,6 +232,12 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
         df_data['Success Rate (%)'].append(f"{avg_success_rate:.2f}")
         df_data['Average Time (s)'].append(f"{avg_task_time:.2f}")
         df_data['Max Time (s)'].append(f"{max_task_time:.2f}")
+        df_data['Inference Wall (s)'].append(format_metric(overall_timing['inference_seconds']))
+        df_data['Inference Wall Chunks'].append(overall_timing['inference_chunks'])
+        df_data['Inference Wall (ms/chunk)'].append(format_metric(overall_timing['inference_ms_per_chunk']))
+        df_data['Inference CUDA (s)'].append(format_metric(overall_timing['inference_cuda_seconds']))
+        df_data['Inference CUDA Chunks'].append(overall_timing['inference_cuda_chunks'])
+        df_data['Inference CUDA (ms/chunk)'].append(format_metric(overall_timing['inference_cuda_ms_per_chunk']))
         if has_psnr_metric:
             df_data['Average Future PSNR (dB)'].append(
                 f"{overall_avg_psnr:.4f}" if overall_avg_psnr is not None else "N/A"
@@ -208,7 +262,13 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
     task_success_data = {
         'Task': [],
         'Description': [],
-        'Success Rate (%)': []
+        'Success Rate (%)': [],
+        'Inference Wall (s)': [],
+        'Inference Wall Chunks': [],
+        'Inference Wall (ms/chunk)': [],
+        'Inference CUDA (s)': [],
+        'Inference CUDA Chunks': [],
+        'Inference CUDA (ms/chunk)': [],
     }
     if has_psnr_metric:
         task_success_data['Future Video PSNR (dB)'] = []
@@ -232,6 +292,12 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
                 result['task_description'] if 'task_description' in result else ''
             )
             task_success_data['Success Rate (%)'].append(f"{result['success_rate']:.2f}")
+            task_success_data['Inference Wall (s)'].append(format_metric(result['inference_seconds']))
+            task_success_data['Inference Wall Chunks'].append(result['inference_chunks'])
+            task_success_data['Inference Wall (ms/chunk)'].append(format_metric(result['inference_ms_per_chunk']))
+            task_success_data['Inference CUDA (s)'].append(format_metric(result['inference_cuda_seconds']))
+            task_success_data['Inference CUDA Chunks'].append(result['inference_cuda_chunks'])
+            task_success_data['Inference CUDA (ms/chunk)'].append(format_metric(result['inference_cuda_ms_per_chunk']))
             if has_psnr_metric:
                 psnr = result['future_video_psnr_mean'] if 'future_video_psnr_mean' in result else None
                 task_success_data['Future Video PSNR (dB)'].append(
@@ -247,6 +313,7 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
             'total_time': stats['total_time'],
             'max_time': stats['max_time'],
         }
+        suite_stats_output[suite].update(summarize_inference_timing(stats['timing_records']))
         if has_psnr_metric:
             suite_stats_output[suite]['average_future_video_psnr'] = (
                 stats['psnr_sum'] / stats['psnr_count'] if stats['psnr_count'] > 0 else None
@@ -263,6 +330,7 @@ def summarize_results(output_dir, *, ckpt=None, config=None):
         'total_time': total_time,
         'average_task_time': total_time/sum(s['total_tasks'] for s in suite_stats.values()) if suite_stats else 0,
     }
+    overall_stats.update(overall_timing)
     if has_psnr_metric:
         overall_stats['average_future_video_psnr'] = (
             overall_psnr_sum / overall_psnr_count if overall_psnr_count > 0 else None
