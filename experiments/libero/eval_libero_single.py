@@ -282,6 +282,11 @@ def _get_num_video_frames(cfg: DictConfig) -> int:
 def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
     if not bool(cfg.EVALUATION.get("visualize_future_video", False)):
         return
+    if bool(cfg.EVALUATION.get("c3cache_enabled", False)):
+        raise ValueError(
+            "EVALUATION.c3cache_enabled=true requires infer_action; "
+            "visualize_future_video uses infer_joint, which does not support C3ache."
+        )
 
     action_conditioned = cfg.model.video_dit_config.get("action_conditioned", None)
     if action_conditioned is not False:
@@ -289,6 +294,46 @@ def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
             "EVALUATION.visualize_future_video=true requires "
             "model.video_dit_config.action_conditioned=false."
         )
+
+
+def _c3cache_infer_kwargs(model: torch.nn.Module, cfg: DictConfig) -> dict[str, Any]:
+    if not bool(cfg.EVALUATION.get("c3cache_enabled", False)):
+        return {}
+    if bool(cfg.EVALUATION.get("visualize_future_video", False)):
+        raise ValueError(
+            "EVALUATION.c3cache_enabled=true requires infer_action; "
+            "visualize_future_video uses infer_joint, which does not support C3ache."
+        )
+
+    cache_keys = (
+        "c3cache_enabled",
+        "c3cache_start_step",
+        "c3cache_end_step",
+        "c3cache_refresh_interval",
+    )
+    parameters = inspect.signature(model.infer_action).parameters
+    unsupported = [
+        key
+        for key in cache_keys
+        if key not in parameters
+        or parameters[key].kind not in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    ]
+    if unsupported or not callable(getattr(model, "reset_c3cache", None)):
+        raise ValueError(
+            f"EVALUATION.c3cache_enabled=true requires {type(model).__name__}.infer_action "
+            f"to explicitly accept {', '.join(cache_keys)} and provide reset_c3cache(). "
+            f"Unsupported infer_action keyword parameters: {unsupported}. "
+            "This model variant does not support C3ache."
+        )
+    return {
+        "c3cache_enabled": True,
+        "c3cache_start_step": int(cfg.EVALUATION.get("c3cache_start_step", 0)),
+        "c3cache_end_step": int(cfg.EVALUATION.get("c3cache_end_step", 6)),
+        "c3cache_refresh_interval": int(cfg.EVALUATION.get("c3cache_refresh_interval", 4)),
+    }
 
 
 def _select_predicted_future_frames(pred_video: list[Image.Image], cfg: DictConfig) -> list[Image.Image]:
@@ -367,6 +412,7 @@ def _predict_action_chunk(
     input_w: int,
     input_h: int,
     model_device: str,
+    episode_metrics: Optional[dict[str, Any]] = None,
 ) -> tuple[np.ndarray, dict, Optional[list[Image.Image]]]:
     num_inference_steps_cfg = cfg.EVALUATION.get("num_inference_steps", None)
     if num_inference_steps_cfg is None:
@@ -412,6 +458,7 @@ def _predict_action_chunk(
 
     compile_action_infer = bool(cfg.EVALUATION.get("compile_action_infer", False))
     infer_method = model.infer_joint if visualize_future_video else model.infer_action
+    infer_kwargs.update(_c3cache_infer_kwargs(model, cfg))
     if not visualize_future_video and "action_infer_mode" in inspect.signature(infer_method).parameters:
         infer_kwargs["action_infer_mode"] = str(
             cfg.EVALUATION.get("action_infer_mode", "idm")
@@ -423,6 +470,8 @@ def _predict_action_chunk(
             f"{type(model).__name__}.{infer_method.__name__} does not support `compile_action_infer`."
         )
 
+    timing_enabled = bool(cfg.EVALUATION.get("timing_enabled", False))
+    infer_t0 = time.perf_counter() if timing_enabled else 0.0
     with torch.no_grad():
         if visualize_future_video:
             pred = model.infer_joint(
@@ -435,6 +484,9 @@ def _predict_action_chunk(
                 **infer_kwargs,
                 compile_action_infer=compile_action_infer,
             )
+    if timing_enabled and episode_metrics is not None:
+        episode_metrics["infer_s"] += time.perf_counter() - infer_t0
+        episode_metrics["infer_chunks"] += 1
     action = pred["action"]  # [T, D]
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
@@ -474,6 +526,7 @@ def run_single_episode(
     input_w: int,
     input_h: int,
     model_device: str,
+    episode_metrics: Optional[dict[str, Any]] = None,
 ) -> tuple[bool, list, list[dict[str, Any]], Optional[float]]:
     max_steps = _get_max_steps(cfg.EVALUATION.task_suite_name)
     replan_steps = int(cfg.EVALUATION.get("replan_steps", 5))
@@ -482,6 +535,8 @@ def run_single_episode(
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
 
+    if _c3cache_infer_kwargs(model, cfg):
+        model.reset_c3cache()
     env.reset()
     obs = env.set_init_state(initial_state)
     if use_action_ensembler:
@@ -517,6 +572,7 @@ def run_single_episode(
                 input_w=input_w,
                 input_h=input_h,
                 model_device=model_device,
+                episode_metrics=episode_metrics,
             )
             if predicted_future_frames is not None:
                 current_replan_idx += 1
@@ -621,12 +677,28 @@ def run_single_task(
         "failure_episodes": [],
         "success_episodes": [],
         "task_description": task_description,
+        "c3cache": {
+            "enabled": bool(cfg.EVALUATION.get("c3cache_enabled", False)),
+            "start_step": int(cfg.EVALUATION.get("c3cache_start_step", 0)),
+            "end_step": int(cfg.EVALUATION.get("c3cache_end_step", 6)),
+            "refresh_interval": int(cfg.EVALUATION.get("c3cache_refresh_interval", 4)),
+        },
     }
+    timing_enabled = bool(cfg.EVALUATION.get("timing_enabled", False))
+    if timing_enabled:
+        results["inference_seconds"] = 0.0
+        results["inference_chunks"] = 0
+        results["episode_inference_seconds"] = []
+        results["episode_inference_chunks"] = []
+    cache_stats_fn = getattr(model, "get_c3cache_stats", None)
+    if results["c3cache"]["enabled"] and callable(cache_stats_fn):
+        results["episode_c3cache_stats"] = []
     if visualize_future_video:
         results["episode_future_video_psnr"] = []
         results["future_video_psnr_mean"] = None
 
     for trial_idx in range(int(cfg.EVALUATION.num_trials)):
+        episode_metrics = {"infer_s": 0.0, "infer_chunks": 0} if timing_enabled else None
         success, replay_images, predicted_future_video_clips, episode_mean_psnr = run_single_episode(
             env=env,
             initial_state=initial_states[trial_idx],
@@ -639,7 +711,15 @@ def run_single_task(
             input_w=input_w,
             input_h=input_h,
             model_device=model_device,
+            episode_metrics=episode_metrics,
         )
+        if episode_metrics is not None:
+            results["inference_seconds"] += episode_metrics["infer_s"]
+            results["inference_chunks"] += episode_metrics["infer_chunks"]
+            results["episode_inference_seconds"].append(episode_metrics["infer_s"])
+            results["episode_inference_chunks"].append(episode_metrics["infer_chunks"])
+        if "episode_c3cache_stats" in results:
+            results["episode_c3cache_stats"].append(cache_stats_fn())
         if success:
             results["successes"] += 1
             results["success_episodes"].append(trial_idx)
@@ -883,6 +963,7 @@ def eval_single_process(cfg: DictConfig):
     model = instantiate(cfg.model, model_dtype=model_dtype, device=model_device)
     _load_model_checkpoint(model, str(cfg.ckpt))
     model = model.to(model_device).eval()
+    _c3cache_infer_kwargs(model, cfg)
 
     dataset_stats_path = _resolve_dataset_stats_path(cfg)
     dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))

@@ -13,6 +13,8 @@ Official codebase for **Fast-WAM: Do World Action Models Need Test-time Future I
 
 This repository contains the training and evaluation code for FastWAM on LIBERO / RoboTwin.
 
+This branch adds an opt-in C³ache action residual cache. See the [reproduction guide (Chinese)](docs/C3ACHE_zh.md) for the implementation plan, configuration, evaluation commands, and checks that require no GPU.
+
 ## What's New
 
 FastWAM is now faster, better suited to large-scale datasets, and more flexible

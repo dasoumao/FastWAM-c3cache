@@ -220,6 +220,10 @@ def main(cfg: DictConfig):
     _append_override(overrides, "negative_prompt", cfg.EVALUATION.negative_prompt)
     _append_override(overrides, "rand_device", cfg.EVALUATION.rand_device)
     _append_override(overrides, "tiled", cfg.EVALUATION.tiled)
+    _append_override(overrides, "c3cache_enabled", cfg.EVALUATION.c3cache_enabled)
+    _append_override(overrides, "c3cache_start_step", cfg.EVALUATION.c3cache_start_step)
+    _append_override(overrides, "c3cache_end_step", cfg.EVALUATION.c3cache_end_step)
+    _append_override(overrides, "c3cache_refresh_interval", cfg.EVALUATION.c3cache_refresh_interval)
     _append_override(overrides, "timing_enabled", cfg.EVALUATION.timing_enabled)
     _append_override(
         overrides,

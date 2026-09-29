@@ -36,6 +36,11 @@ EVALUATION:
   rand_device: cpu
   tiled: false
   compile_action_infer: true
+  timing_enabled: false
+  c3cache_enabled: false
+  c3cache_start_step: 0
+  c3cache_end_step: 6
+  c3cache_refresh_interval: 4
 
   # Optional external inputs
   dataset_stats_path: null

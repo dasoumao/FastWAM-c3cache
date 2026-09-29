@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import sys
@@ -135,6 +136,32 @@ def _resize_rgb(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
     return np.asarray(resized, dtype=np.uint8)
 
 
+def _validate_c3cache_support(model: torch.nn.Module) -> None:
+    cache_keys = (
+        "c3cache_enabled",
+        "c3cache_start_step",
+        "c3cache_end_step",
+        "c3cache_refresh_interval",
+    )
+    parameters = inspect.signature(model.infer_action).parameters
+    unsupported = [
+        key
+        for key in cache_keys
+        if key not in parameters
+        or parameters[key].kind not in (
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        )
+    ]
+    if unsupported or not callable(getattr(model, "reset_c3cache", None)):
+        raise ValueError(
+            f"c3cache_enabled=true requires {type(model).__name__}.infer_action "
+            f"to explicitly accept {', '.join(cache_keys)} and provide reset_c3cache(). "
+            f"Unsupported infer_action keyword parameters: {unsupported}. "
+            "This model variant does not support C3ache."
+        )
+
+
 class WorldActionRobotWinPolicy:
     def __init__(
         self,
@@ -155,6 +182,14 @@ class WorldActionRobotWinPolicy:
         tiled: bool,
         timing_enabled: bool,
         num_video_frames: int,
+        *,
+        c3cache_enabled: bool = False,
+        c3cache_start_step: int = 0,
+        c3cache_end_step: int = 6,
+        c3cache_refresh_interval: int = 4,
+        timing_output_dir: Optional[Path] = None,
+        task_name: Optional[str] = None,
+        task_config: Optional[str] = None,
     ) -> None:
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
@@ -162,6 +197,9 @@ class WorldActionRobotWinPolicy:
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         self.model.load_checkpoint(checkpoint_path)
         self.model = self.model.to(device).eval()
+        if c3cache_enabled:
+            _validate_c3cache_support(self.model)
+            self.model.reset_c3cache()
 
         self.processor: FastWAMProcessor = instantiate(processor_cfg).eval()
         dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
@@ -176,13 +214,27 @@ class WorldActionRobotWinPolicy:
         self.negative_prompt = str(negative_prompt)
         self.rand_device = str(rand_device)
         self.tiled = bool(tiled)
+        self.c3cache_enabled = bool(c3cache_enabled)
+        self.c3cache_start_step = int(c3cache_start_step)
+        self.c3cache_end_step = int(c3cache_end_step)
+        self.c3cache_refresh_interval = int(c3cache_refresh_interval)
         self.timing_enabled = bool(timing_enabled)
+        self.task_name = task_name
+        self.task_config = task_config
+        timing_tag = "".join(
+            char if char.isalnum() or char in "_-" else "_"
+            for char in str(task_config or "unspecified")
+        )
+        self._timing_output_path = (
+            Path(timing_output_dir) / f"fastwam_inference_timing_{timing_tag}.jsonl"
+            if timing_output_dir is not None else None
+        )
         self._num_video_frames = int(num_video_frames)
 
         self.pending_actions: deque[np.ndarray] = deque()
         self.episode_count = 0
         self.step_count = 0
-        self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0}
+        self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0, "infer_chunks": 0}
 
         logger.info(
             "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
@@ -254,11 +306,44 @@ class WorldActionRobotWinPolicy:
         }
         if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
+        if self.c3cache_enabled:
+            infer_kwargs.update(
+                c3cache_enabled=True,
+                c3cache_start_step=self.c3cache_start_step,
+                c3cache_end_step=self.c3cache_end_step,
+                c3cache_refresh_interval=self.c3cache_refresh_interval,
+            )
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
             pred = self.model.infer_action(**infer_kwargs)
         if self.timing_enabled:
-            self._timing_rollout["infer_s"] += time.perf_counter() - infer_t0
+            infer_s = time.perf_counter() - infer_t0
+            self._timing_rollout["infer_s"] += infer_s
+            self._timing_rollout["infer_chunks"] += 1
+            timing_record = {
+                "task_name": self.task_name,
+                "task_config": self.task_config,
+                "episode": self.episode_count,
+                "chunk": self._timing_rollout["infer_chunks"],
+                "infer_s": infer_s,
+                "cumulative_infer_s": self._timing_rollout["infer_s"],
+                "c3cache": {
+                    "enabled": self.c3cache_enabled,
+                    "start_step": self.c3cache_start_step,
+                    "end_step": self.c3cache_end_step,
+                    "refresh_interval": self.c3cache_refresh_interval,
+                },
+            }
+            if self.c3cache_enabled:
+                stats_fn = getattr(self.model, "get_c3cache_stats", None)
+                if callable(stats_fn):
+                    timing_record["c3cache_stats"] = stats_fn()
+            if self._timing_output_path is None:
+                print(f"FastWAM inference timing: {json.dumps(timing_record)}", flush=True)
+            else:
+                self._timing_output_path.parent.mkdir(parents=True, exist_ok=True)
+                with self._timing_output_path.open("a", encoding="utf-8") as timing_file:
+                    timing_file.write(json.dumps(timing_record) + "\n")
 
         action_tensor = pred["action"]  # [T, D]
         action_chunk = self._denormalize_action(action_tensor)[0]  # [T, D]
@@ -297,15 +382,19 @@ class WorldActionRobotWinPolicy:
     def reset_timing_rollout(self) -> None:
         self._timing_rollout["infer_s"] = 0.0
         self._timing_rollout["sim_s"] = 0.0
+        self._timing_rollout["infer_chunks"] = 0
 
-    def get_timing_rollout(self) -> Dict[str, float]:
+    def get_timing_rollout(self) -> Dict[str, float | int]:
         return {
             "infer_s": float(self._timing_rollout["infer_s"]),
             "sim_s": float(self._timing_rollout["sim_s"]),
+            "infer_chunks": int(self._timing_rollout["infer_chunks"]),
         }
 
     def reset(self) -> None:
         self.pending_actions.clear()
+        if self.c3cache_enabled:
+            self.model.reset_c3cache()
         self.episode_count += 1
         self.step_count = 0
         self.reset_timing_rollout()
@@ -365,6 +454,18 @@ def get_model(usr_args: Dict[str, Any]):
     negative_prompt = str(usr_args.get("negative_prompt", cfg.EVALUATION.get("negative_prompt", "")))
     rand_device = str(usr_args.get("rand_device", cfg.EVALUATION.get("rand_device", "cpu")))
     tiled = _parse_bool(usr_args.get("tiled", cfg.EVALUATION.get("tiled", False)))
+    c3cache_enabled = _parse_bool(
+        usr_args.get("c3cache_enabled", cfg.EVALUATION.get("c3cache_enabled", False))
+    )
+    c3cache_start_step = int(
+        usr_args.get("c3cache_start_step", cfg.EVALUATION.get("c3cache_start_step", 0))
+    )
+    c3cache_end_step = int(
+        usr_args.get("c3cache_end_step", cfg.EVALUATION.get("c3cache_end_step", 6))
+    )
+    c3cache_refresh_interval = int(
+        usr_args.get("c3cache_refresh_interval", cfg.EVALUATION.get("c3cache_refresh_interval", 4))
+    )
     timing_enabled = _parse_bool(
         usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
@@ -385,7 +486,22 @@ def get_model(usr_args: Dict[str, Any]):
         negative_prompt=negative_prompt,
         rand_device=rand_device,
         tiled=tiled,
+        c3cache_enabled=c3cache_enabled,
+        c3cache_start_step=c3cache_start_step,
+        c3cache_end_step=c3cache_end_step,
+        c3cache_refresh_interval=c3cache_refresh_interval,
         timing_enabled=timing_enabled,
+        timing_output_dir=(
+            Path(str(usr_args["eval_output_dir"]))
+            if not _is_none_like(usr_args.get("eval_output_dir")) else None
+        ),
+        task_name=(
+            str(usr_args["task_name"]) if not _is_none_like(usr_args.get("task_name")) else None
+        ),
+        task_config=(
+            str(usr_args["task_config"])
+            if not _is_none_like(usr_args.get("task_config")) else None
+        ),
         num_video_frames=(int(cfg.data.train.num_frames) - 1) // int(cfg.data.train.action_video_freq_ratio) + 1,
     )
     return policy

@@ -22,5 +22,9 @@ text_cfg_scale: 1.0
 negative_prompt: ""
 rand_device: cpu
 tiled: false
+c3cache_enabled: false
+c3cache_start_step: 0
+c3cache_end_step: 6
+c3cache_refresh_interval: 4
 timing_enabled: false
 skip_get_obs_within_replan: false

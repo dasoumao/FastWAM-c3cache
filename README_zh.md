@@ -13,6 +13,8 @@
 
 本仓库包含 FastWAM 在 LIBERO / RoboTwin 上的训练与评估代码。
 
+本分支新增 [C³ache 跨 action chunk residual 缓存复现说明](docs/C3ACHE_zh.md)，包含代码修改计划、配置、评测命令和无 GPU 检查方式。缓存默认关闭。
+
 ## What's New
 
 FastWAM 现在更快、更适合大规模数据，也为研究提供了更灵活的模型选择。本次更新带来了显著的

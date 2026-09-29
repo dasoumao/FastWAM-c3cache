@@ -1,3 +1,4 @@
+import hashlib
 from typing import Any, Optional, Sequence, Union
 
 import torch
@@ -8,6 +9,7 @@ from PIL import Image
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
+from .c3cache import C3Cache, validate_c3cache_range
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -87,6 +89,7 @@ class FastWAM(torch.nn.Module):
         self.loss_lambda_action = float(loss_lambda_action)
         self.compile_training_denoise = bool(compile_training_denoise)
         self.mot.compile_training_layers = self.compile_training_denoise
+        self._c3cache = C3Cache()
 
         self.to(self.device)
 
@@ -186,12 +189,39 @@ class FastWAM(torch.nn.Module):
         return model
 
     def to(self, *args, **kwargs):
+        if hasattr(self, "_c3cache"):
+            self.reset_c3cache()
         super().to(*args, **kwargs)
         self.mot.to(*args, **kwargs)
         if self.text_encoder is not None:
             self.text_encoder.to(*args, **kwargs)
         self.vae.to(*args, **kwargs)
         return self
+
+    def train(self, mode: bool = True):
+        if mode and hasattr(self, "_c3cache"):
+            self.reset_c3cache()
+        return super().train(mode)
+
+    def load_state_dict(self, *args, **kwargs):
+        self.reset_c3cache()
+        return super().load_state_dict(*args, **kwargs)
+
+    def reset_c3cache(self) -> None:
+        """Start a new action episode and discard all cached residuals."""
+        self._c3cache.reset()
+
+    def get_c3cache_stats(self) -> dict[str, Any]:
+        """Return completed chunk and denoising step counts for the episode."""
+        return self._c3cache.stats()
+
+    @staticmethod
+    def _c3cache_tensor_digest(value: torch.Tensor) -> bytes:
+        # The precomputed-context path has no prompt string to identify it. Hash
+        # values rather than tensor identities: callers may copy the same context
+        # on every chunk, and an in-place edit must invalidate cached residuals.
+        raw = value.detach().contiguous().view(torch.uint8).cpu().numpy().tobytes()
+        return hashlib.sha256(raw).digest()
 
     @staticmethod
     def _check_resize_height_width(height, width, num_frames):
@@ -735,6 +765,52 @@ class FastWAM(torch.nn.Module):
         )
         return self.action_expert.post(action_tokens)
 
+    def _denoise_action_c3cache_refresh(
+        self,
+        latents_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_cache_k: list[torch.Tensor],
+        video_cache_v: list[torch.Tensor],
+        action_attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run the full action stack and return its residual over input tokens."""
+        (
+            action_tokens,
+            _t,
+            action_t_mod,
+            action_context,
+            action_context_mask,
+            action_freqs,
+        ) = self.action_expert.prepare(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+        full_tokens = self.mot.forward_action_with_video_cache_tensor(
+            action_tokens=action_tokens,
+            action_freqs=action_freqs,
+            action_t_mod=action_t_mod,
+            action_context=action_context,
+            action_context_mask=action_context_mask,
+            video_cache_k=video_cache_k,
+            video_cache_v=video_cache_v,
+            action_attention_mask=action_attention_mask,
+        )
+        # Use full_tokens directly for this step. Reconstructing it from the
+        # residual would add an avoidable rounding difference on refresh.
+        return self.action_expert.post(full_tokens), full_tokens - action_tokens
+
+    def _denoise_action_c3cache_reuse(
+        self,
+        latents_action: torch.Tensor,
+        residual: torch.Tensor,
+    ) -> torch.Tensor:
+        # The current noisy action, not the image, supplies the input tokens.
+        return self.action_expert.post(self.action_expert.action_encoder(latents_action) + residual)
+
     @torch.no_grad()
     def _predict_action_noise_with_cache(
         self,
@@ -992,7 +1068,23 @@ class FastWAM(torch.nn.Module):
         rand_device: str = "cpu",
         tiled: bool = False,
         compile_action_infer: bool = False,
+        c3cache_enabled: bool = False,
+        c3cache_start_step: int = 0,
+        c3cache_end_step: int = 6,
+        c3cache_refresh_interval: int = 4,
     ) -> dict[str, Any]:
+        if c3cache_enabled:
+            if type(self) is not FastWAM:
+                raise ValueError("C3ache is supported only by the base FastWAM action sampler.")
+            validate_c3cache_range(
+                num_inference_steps,
+                c3cache_start_step,
+                c3cache_end_step,
+                c3cache_refresh_interval,
+            )
+        elif self._c3cache.signature is not None:
+            # A disabled call ends the episode. Re-enabling starts at chunk zero.
+            self.reset_c3cache()
         self.eval()
         if str(getattr(self.video_expert, "video_attention_mask_mode", "")) != "first_frame_causal":
             raise ValueError(
@@ -1057,11 +1149,49 @@ class FastWAM(torch.nn.Module):
                 )
             context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
             context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        if c3cache_enabled:
+            # Proprio and image observations change on every chunk. They must
+            # still feed the current video prefill but must not invalidate the
+            # action residual cache. Only the task text is episode identity.
+            c3cache_context_identity = (
+                ("prompt", prompt)
+                if prompt is not None
+                else (
+                    "context",
+                    self._c3cache_tensor_digest(context),
+                    self._c3cache_tensor_digest(context_mask),
+                )
+            )
         if proprio is not None:
             context, context_mask = self._append_proprio_to_context(
                 context=context,
                 context_mask=context_mask,
                 proprio=proprio,
+            )
+
+        if c3cache_enabled:
+            c3cache_signature = (
+                num_inference_steps,
+                float(self.infer_action_scheduler.shift if sigma_shift is None else sigma_shift),
+                int(self.infer_action_scheduler.num_train_timesteps),
+                action_horizon,
+                tuple(input_image.shape),
+                tuple(latents_action.shape),
+                str(latents_action.device),
+                str(latents_action.dtype),
+                str(context.device),
+                str(context.dtype),
+                str(torch.is_autocast_enabled(self.device.type)),
+                str(torch.get_autocast_dtype(self.device.type)),
+                bool(compile_action_infer),
+                bool(tiled),
+                bool(fuse_flag),
+                c3cache_start_step,
+                c3cache_end_step,
+                c3cache_refresh_interval,
+                tuple(context.shape),
+                tuple(context_mask.shape),
+                c3cache_context_identity,
             )
 
         timestep_video = torch.zeros(
@@ -1115,6 +1245,25 @@ class FastWAM(torch.nn.Module):
         else:
             prefill_video_cache = self.mot.prefill_video_cache_tensor
             denoise_action_with_video_cache = self._denoise_action_with_video_cache
+        if c3cache_enabled:
+            if compile_action_infer:
+                if not hasattr(self, "_denoise_action_c3cache_refresh_compiled"):
+                    self._denoise_action_c3cache_refresh_compiled = torch.compile(
+                        self._denoise_action_c3cache_refresh,
+                        mode="reduce-overhead",
+                        fullgraph=True,
+                    )
+                if not hasattr(self, "_denoise_action_c3cache_reuse_compiled"):
+                    self._denoise_action_c3cache_reuse_compiled = torch.compile(
+                        self._denoise_action_c3cache_reuse,
+                        mode="reduce-overhead",
+                        fullgraph=True,
+                    )
+                c3cache_refresh = self._denoise_action_c3cache_refresh_compiled
+                c3cache_reuse = self._denoise_action_c3cache_reuse_compiled
+            else:
+                c3cache_refresh = self._denoise_action_c3cache_refresh
+                c3cache_reuse = self._denoise_action_c3cache_reuse
         if compile_action_infer:
             torch.compiler.cudagraph_mark_step_begin()
         video_cache_k, video_cache_v = prefill_video_cache(
@@ -1136,27 +1285,66 @@ class FastWAM(torch.nn.Module):
             dtype=latents_action.dtype,
             shift_override=sigma_shift,
         )
-        for step_t_action, step_delta_action in zip(infer_timesteps_action, infer_deltas_action):
-            if compile_action_infer:
-                torch.compiler.cudagraph_mark_step_begin()
-            timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
+        if c3cache_enabled:
+            self._c3cache.begin(c3cache_signature)
+        staged_residuals: dict[int, torch.Tensor] = {}
+        full_steps = reused_steps = 0
+        try:
+            for step_index, (step_t_action, step_delta_action) in enumerate(
+                zip(infer_timesteps_action, infer_deltas_action)
+            ):
+                if compile_action_infer:
+                    torch.compiler.cudagraph_mark_step_begin()
+                timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
-            pred_action_posi = denoise_action_with_video_cache(
-                latents_action=latents_action,
-                timestep_action=timestep_action,
-                context=context,
-                context_mask=context_mask,
-                video_cache_k=video_cache_k,
-                video_cache_v=video_cache_v,
-                action_attention_mask=action_attention_mask,
-            )
-            pred_action = pred_action_posi
+                if c3cache_enabled and self._c3cache.should_reuse(
+                    step_index,
+                    c3cache_start_step,
+                    c3cache_end_step,
+                    c3cache_refresh_interval,
+                ):
+                    pred_action = c3cache_reuse(
+                        latents_action=latents_action,
+                        residual=self._c3cache.residuals[step_index],
+                    )
+                    reused_steps += 1
+                elif c3cache_enabled and c3cache_start_step <= step_index <= c3cache_end_step:
+                    pred_action, residual = c3cache_refresh(
+                        latents_action=latents_action,
+                        timestep_action=timestep_action,
+                        context=context,
+                        context_mask=context_mask,
+                        video_cache_k=video_cache_k,
+                        video_cache_v=video_cache_v,
+                        action_attention_mask=action_attention_mask,
+                    )
+                    # Compiled reduce-overhead outputs may be overwritten on graph
+                    # replay, so persistent residuals always own their storage.
+                    staged_residuals[step_index] = residual.detach().clone()
+                    full_steps += 1
+                else:
+                    pred_action = denoise_action_with_video_cache(
+                        latents_action=latents_action,
+                        timestep_action=timestep_action,
+                        context=context,
+                        context_mask=context_mask,
+                        video_cache_k=video_cache_k,
+                        video_cache_v=video_cache_v,
+                        action_attention_mask=action_attention_mask,
+                    )
+                    if c3cache_enabled:
+                        full_steps += 1
 
-            latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+                latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
-        return {
-            "action": latents_action[0].detach().to(device="cpu", dtype=torch.float32),
-        }
+            action_out = latents_action[0].detach().to(device="cpu", dtype=torch.float32)
+        except Exception:
+            if c3cache_enabled:
+                self.reset_c3cache()
+            raise
+        if c3cache_enabled:
+            self._c3cache.commit(staged_residuals, full_steps, reused_steps)
+        return {"action": action_out}
 
     @torch.no_grad()
     def infer(
@@ -1209,6 +1397,7 @@ class FastWAM(torch.nn.Module):
         torch.save(payload, path)
 
     def load_checkpoint(self, path, optimizer=None):
+        self.reset_c3cache()
         payload = torch.load(path, map_location="cpu")
         if "mot" in payload:
             self.mot.load_state_dict(payload["mot"], strict=False)
