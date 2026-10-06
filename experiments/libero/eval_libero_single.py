@@ -542,6 +542,16 @@ def run_single_episode(
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
 
+    diagnostic_context_fn = getattr(model, "set_inference_diagnostic_context", None)
+    if (
+        bool(cfg.EVALUATION.get("inference_diagnostics_enabled", False))
+        and callable(diagnostic_context_fn)
+    ):
+        diagnostic_context_fn(
+            task_suite_name=str(cfg.EVALUATION.task_suite_name),
+            task_id=int(cfg.EVALUATION.task_id),
+            episode_index=episode_idx,
+        )
     if _c3cache_infer_kwargs(model, cfg):
         model.reset_c3cache()
     env.reset()
@@ -677,8 +687,31 @@ def run_single_task(
     input_h: int,
     model_device: str,
 ) -> dict:
-    env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
+    diagnostics_enabled = bool(cfg.EVALUATION.get("inference_diagnostics_enabled", False))
+    configure_diagnostics = getattr(model, "configure_inference_diagnostics", None)
+    if diagnostics_enabled:
+        if visualize_future_video:
+            raise ValueError(
+                "EVALUATION.inference_diagnostics_enabled=true requires infer_action; "
+                "visualize_future_video uses infer_joint."
+            )
+        get_diagnostics = getattr(model, "get_inference_diagnostics", None)
+        if not callable(configure_diagnostics) or not callable(get_diagnostics):
+            raise ValueError(
+                "EVALUATION.inference_diagnostics_enabled=true requires a model with "
+                "configure_inference_diagnostics() and get_inference_diagnostics()."
+            )
+        configure_diagnostics(
+            enabled=True,
+            every_n_chunks=int(cfg.EVALUATION.get("inference_diagnostics_every_n_chunks", 1)),
+            max_chunks=int(cfg.EVALUATION.get("inference_diagnostics_max_chunks", 200)),
+            cuda_events=bool(cfg.EVALUATION.get("inference_diagnostics_cuda_events", True)),
+        )
+    elif callable(configure_diagnostics):
+        # Persistent workers reuse the same model for multiple tasks.
+        configure_diagnostics(enabled=False)
+    env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
     results = {
         "successes": 0,
         "failure_episodes": [],
@@ -809,6 +842,8 @@ def run_single_task(
             results["future_video_psnr_mean"] = float(np.mean(valid_episode_psnr))
     if timing_enabled:
         results.update(summarize_inference_timing([results]))
+    if diagnostics_enabled:
+        results["inference_diagnostics"] = get_diagnostics()
     return results
 
 

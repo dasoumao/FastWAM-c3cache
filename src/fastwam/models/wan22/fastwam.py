@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 
+from fastwam.inference_diagnostics import InferenceDiagnostics, record_inference_diagnostics
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
@@ -1051,7 +1052,28 @@ class FastWAM(torch.nn.Module):
             "action": action_out,
         }
 
+    def configure_inference_diagnostics(
+        self, *, enabled=False, every_n_chunks=1, max_chunks=200, cuda_events=True,
+    ):
+        if enabled and type(self) is not FastWAM:
+            raise ValueError("Inference diagnostics currently support only base FastWAM.infer_action.")
+        if not hasattr(self, "_inference_diagnostics"):
+            self._inference_diagnostics = InferenceDiagnostics()
+        self._inference_diagnostics.configure(
+            enabled=enabled, every_n_chunks=every_n_chunks,
+            max_chunks=max_chunks, cuda_events=cuda_events,
+        )
+
+    def set_inference_diagnostic_context(self, **context):
+        if hasattr(self, "_inference_diagnostics"):
+            self._inference_diagnostics.context = dict(context)
+
+    def get_inference_diagnostics(self):
+        recorder = getattr(self, "_inference_diagnostics", None)
+        return recorder.export() if recorder is not None else {"enabled": False, "records": []}
+
     @torch.no_grad()
+    @record_inference_diagnostics
     def infer_action(
         self,
         prompt: Optional[str],
@@ -1073,6 +1095,7 @@ class FastWAM(torch.nn.Module):
         c3cache_end_step: int = 6,
         c3cache_refresh_interval: int = 4,
     ) -> dict[str, Any]:
+        diagnostic = getattr(self, "_active_inference_diagnostic", None)
         if c3cache_enabled:
             if type(self) is not FastWAM:
                 raise ValueError("C3ache is supported only by the base FastWAM action sampler.")
@@ -1124,7 +1147,11 @@ class FastWAM(torch.nn.Module):
         ).to(device=self.device, dtype=self.torch_dtype)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
+        if diagnostic:
+            diagnostic.mark("vae_encode")
         first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        if diagnostic:
+            diagnostic.mark("context_prepare")
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
         use_prompt = prompt is not None
@@ -1149,6 +1176,8 @@ class FastWAM(torch.nn.Module):
                 )
             context = context.to(device=self.device, dtype=self.torch_dtype, non_blocking=True)
             context_mask = context_mask.to(device=self.device, dtype=torch.bool, non_blocking=True)
+        if diagnostic:
+            diagnostic.mark("cache_identity")
         if c3cache_enabled:
             # Proprio and image observations change on every chunk. They must
             # still feed the current video prefill but must not invalidate the
@@ -1162,6 +1191,8 @@ class FastWAM(torch.nn.Module):
                     self._c3cache_tensor_digest(context_mask),
                 )
             )
+        if diagnostic:
+            diagnostic.mark("proprio_and_cache_signature")
         if proprio is not None:
             context, context_mask = self._append_proprio_to_context(
                 context=context,
@@ -1194,6 +1225,18 @@ class FastWAM(torch.nn.Module):
                 c3cache_context_identity,
             )
 
+        if diagnostic:
+            diagnostic.record.update(
+                image_shape=list(input_image.shape),
+                action_shape=list(latents_action.shape),
+                context_shape=list(context.shape),
+                context_stride=list(context.stride()),
+                dtype=str(latents_action.dtype),
+                effective_sigma_shift=float(
+                    self.infer_action_scheduler.shift if sigma_shift is None else sigma_shift
+                ),
+            )
+            diagnostic.mark("video_prepare")
         timestep_video = torch.zeros(
             (first_frame_latents.shape[0],),
             dtype=first_frame_latents.dtype,
@@ -1227,6 +1270,8 @@ class FastWAM(torch.nn.Module):
         )
         video_attention_mask = attention_mask[:video_seq_len, :video_seq_len]
         action_attention_mask = attention_mask[video_seq_len:, :]
+        if diagnostic:
+            diagnostic.mark("compile_dispatch_setup")
         if compile_action_infer:
             if not hasattr(self, "_prefill_video_cache_compiled"):
                 self._prefill_video_cache_compiled = torch.compile(
@@ -1266,6 +1311,8 @@ class FastWAM(torch.nn.Module):
                 c3cache_reuse = self._denoise_action_c3cache_reuse
         if compile_action_infer:
             torch.compiler.cudagraph_mark_step_begin()
+        if diagnostic:
+            diagnostic.mark("video_prefill", core=True)
         video_cache_k, video_cache_v = prefill_video_cache(
             video_tokens=video_tokens,
             video_freqs=video_freqs,
@@ -1274,11 +1321,15 @@ class FastWAM(torch.nn.Module):
             video_context_mask=video_context_mask,
             video_attention_mask=video_attention_mask,
         )
+        if diagnostic:
+            diagnostic.mark("video_kv_clone")
         if compile_action_infer:
             # Inductor reduce-overhead may return graph-owned buffers that are overwritten on replay.
             video_cache_k = [cache.clone() for cache in video_cache_k]
             video_cache_v = [cache.clone() for cache in video_cache_v]
 
+        if diagnostic:
+            diagnostic.mark("schedule_and_cache_lookup")
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
             device=self.device,
@@ -1287,12 +1338,17 @@ class FastWAM(torch.nn.Module):
         )
         if c3cache_enabled:
             self._c3cache.begin(c3cache_signature)
+        if diagnostic:
+            diagnostic.record["cache_chunk_index"] = self._c3cache.chunk_index if c3cache_enabled else None
+            diagnostic.record["cached_steps_before"] = sorted(self._c3cache.residuals) if c3cache_enabled else []
         staged_residuals: dict[int, torch.Tensor] = {}
         full_steps = reused_steps = 0
         try:
             for step_index, (step_t_action, step_delta_action) in enumerate(
                 zip(infer_timesteps_action, infer_deltas_action)
             ):
+                if diagnostic:
+                    diagnostic.mark("step_setup", step_index=step_index)
                 if compile_action_infer:
                     torch.compiler.cudagraph_mark_step_begin()
                 timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
@@ -1303,12 +1359,16 @@ class FastWAM(torch.nn.Module):
                     c3cache_end_step,
                     c3cache_refresh_interval,
                 ):
+                    if diagnostic:
+                        diagnostic.mark("action_reuse", step_index=step_index, core=True)
                     pred_action = c3cache_reuse(
                         latents_action=latents_action,
                         residual=self._c3cache.residuals[step_index],
                     )
                     reused_steps += 1
                 elif c3cache_enabled and c3cache_start_step <= step_index <= c3cache_end_step:
+                    if diagnostic:
+                        diagnostic.mark("action_refresh", step_index=step_index, core=True)
                     pred_action, residual = c3cache_refresh(
                         latents_action=latents_action,
                         timestep_action=timestep_action,
@@ -1318,11 +1378,15 @@ class FastWAM(torch.nn.Module):
                         video_cache_v=video_cache_v,
                         action_attention_mask=action_attention_mask,
                     )
+                    if diagnostic:
+                        diagnostic.mark("residual_clone", step_index=step_index)
                     # Compiled reduce-overhead outputs may be overwritten on graph
                     # replay, so persistent residuals always own their storage.
                     staged_residuals[step_index] = residual.detach().clone()
                     full_steps += 1
                 else:
+                    if diagnostic:
+                        diagnostic.mark("action_full", step_index=step_index, core=True)
                     pred_action = denoise_action_with_video_cache(
                         latents_action=latents_action,
                         timestep_action=timestep_action,
@@ -1335,13 +1399,19 @@ class FastWAM(torch.nn.Module):
                     if c3cache_enabled:
                         full_steps += 1
 
+                if diagnostic:
+                    diagnostic.mark("scheduler_step", step_index=step_index)
                 latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
 
+            if diagnostic:
+                diagnostic.mark("output_to_cpu")
             action_out = latents_action[0].detach().to(device="cpu", dtype=torch.float32)
         except Exception:
             if c3cache_enabled:
                 self.reset_c3cache()
             raise
+        if diagnostic:
+            diagnostic.mark("cache_commit")
         if c3cache_enabled:
             self._c3cache.commit(staged_residuals, full_steps, reused_steps)
         return {"action": action_out}

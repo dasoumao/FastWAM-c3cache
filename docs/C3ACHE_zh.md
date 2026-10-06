@@ -161,4 +161,6 @@ LIBERO 的任务 JSON 保留逐 episode 时间和缓存统计，并把计时汇�
 
 所有实际推理调用都会计入，包括首个 chunk 和首次编译；实现不会额外生成 warmup action，也不会为了计时改变 residual 缓存。比较基线和 C³ache 时保持同一编译设置，并优先同时报告总时间、每 chunk 时间、chunk 数和成功率。若要观察稳定运行时的速度，先采用 `compile_action_infer=false`，或单独分析首调用/编译开销；不要把包含编译的均值标成纯 GPU kernel 延迟。
 
+要分析 compile 与缓存为什么没有等比例叠加，参见 [分阶段推理诊断](INFERENCE_DIAGNOSTICS_zh.md)。新增诊断默认关闭，支持 LIBERO/RoboTwin 逐 chunk、逐 action step 的 host/CUDA Event 观测、编译计数和离线对比报告。研究方向见 [WAM 缓存研究报告](../reports/wam_cache_research_20261006.md)。
+
 如果 episode 有 C 个 chunk，缓存 M/N 个 step，τ>0 时刷新次数为 `ceil(C/τ)`；τ=0 时为 1。忽略提前失效时，完整 action DiT 调用次数为 `refresh_count*N + (C-refresh_count)*(N-M)`。这个计数用于验证调度，不能当成端到端加速比，因为编码、prefill、head 和 scheduler 仍有开销。

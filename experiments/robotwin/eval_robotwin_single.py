@@ -47,6 +47,7 @@ if str(SRC_ROOT) not in sys.path:
     sys.path.insert(0, str(SRC_ROOT))
 
 from fastwam.inference_timing import summarize_inference_timing
+from fastwam.inference_diagnostics import summarize_diagnostic_records
 
 POLICY_NAME = "fastwam_policy"
 
@@ -234,6 +235,9 @@ def main(cfg: DictConfig):
     timing_tag = _timing_tag(str(cfg.EVALUATION.task_config))
     timing_log = robotwin_eval_base / f"fastwam_inference_timing_{timing_tag}.jsonl"
     timing_summary_path = robotwin_eval_base / f"fastwam_inference_summary_{timing_tag}.json"
+    diagnostics_enabled = bool(cfg.EVALUATION.get("inference_diagnostics_enabled", False))
+    diagnostics_log = robotwin_eval_base / f"fastwam_inference_diagnostics_{timing_tag}.jsonl"
+    diagnostics_summary_path = robotwin_eval_base / f"fastwam_inference_diagnostics_{timing_tag}.json"
 
     sim_cfg_path = (PROJECT_ROOT / "configs" / "sim_robotwin.yaml").resolve()
     sim_task = HydraConfig.get().runtime.choices.get("task")
@@ -263,11 +267,28 @@ def main(cfg: DictConfig):
     _append_override(overrides, "negative_prompt", cfg.EVALUATION.negative_prompt)
     _append_override(overrides, "rand_device", cfg.EVALUATION.rand_device)
     _append_override(overrides, "tiled", cfg.EVALUATION.tiled)
+    _append_override(overrides, "compile_action_infer", cfg.EVALUATION.compile_action_infer)
     _append_override(overrides, "c3cache_enabled", cfg.EVALUATION.c3cache_enabled)
     _append_override(overrides, "c3cache_start_step", cfg.EVALUATION.c3cache_start_step)
     _append_override(overrides, "c3cache_end_step", cfg.EVALUATION.c3cache_end_step)
     _append_override(overrides, "c3cache_refresh_interval", cfg.EVALUATION.c3cache_refresh_interval)
     _append_override(overrides, "timing_enabled", cfg.EVALUATION.timing_enabled)
+    _append_override(overrides, "inference_diagnostics_enabled", diagnostics_enabled)
+    _append_override(
+        overrides,
+        "inference_diagnostics_every_n_chunks",
+        cfg.EVALUATION.inference_diagnostics_every_n_chunks,
+    )
+    _append_override(
+        overrides,
+        "inference_diagnostics_max_chunks",
+        cfg.EVALUATION.inference_diagnostics_max_chunks,
+    )
+    _append_override(
+        overrides,
+        "inference_diagnostics_cuda_events",
+        cfg.EVALUATION.inference_diagnostics_cuda_events,
+    )
     _append_override(
         overrides,
         "skip_get_obs_within_replan",
@@ -293,6 +314,9 @@ def main(cfg: DictConfig):
     if cfg.EVALUATION.timing_enabled:
         robotwin_eval_base.mkdir(parents=True, exist_ok=True)
         timing_log.write_text("", encoding="utf-8")
+    if diagnostics_enabled:
+        robotwin_eval_base.mkdir(parents=True, exist_ok=True)
+        diagnostics_log.write_text("", encoding="utf-8")
 
     with open(log_file, "w", encoding="utf-8") as log_f:
         process = subprocess.Popen(
@@ -318,6 +342,53 @@ def main(cfg: DictConfig):
     timing_records = (
         _read_timing_records(timing_log) if cfg.EVALUATION.timing_enabled else []
     )
+    if diagnostics_enabled:
+        diagnostic_records = []
+        diagnostic_metadata = {}
+        for line_number, line in enumerate(
+            diagnostics_log.read_text(encoding="utf-8").splitlines(), 1
+        ):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError as exc:
+                raise ValueError(
+                    f"Invalid inference diagnostic record at {diagnostics_log}:{line_number}"
+                ) from exc
+            if not isinstance(record, dict):
+                raise ValueError(
+                    f"Expected object at {diagnostics_log}:{line_number}"
+                )
+            if "_task_metadata" in record:
+                diagnostic_metadata = record.pop("_task_metadata")
+            diagnostic_records.append(record)
+        diagnostic_payload = {
+            "schema_version": 1,
+            "enabled": True,
+            "task_name": str(cfg.EVALUATION.task_name),
+            "task_config": str(cfg.EVALUATION.task_config),
+            "metadata": diagnostic_metadata,
+            "sampling": {
+                "every_n_chunks": int(cfg.EVALUATION.inference_diagnostics_every_n_chunks),
+                "max_chunks": int(cfg.EVALUATION.inference_diagnostics_max_chunks),
+                "cuda_events": bool(cfg.EVALUATION.inference_diagnostics_cuda_events),
+                "observed_chunks": len(timing_records) if cfg.EVALUATION.timing_enabled else None,
+                "sampled_chunks": len(diagnostic_records),
+                "limit_reached": (
+                    len(diagnostic_records)
+                    >= int(cfg.EVALUATION.inference_diagnostics_max_chunks)
+                ),
+            },
+            "records": diagnostic_records,
+            "summary": summarize_diagnostic_records(diagnostic_records),
+        }
+        diagnostics_summary_path.write_text(
+            json.dumps(diagnostic_payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        print(f"Inference diagnostics saved to: {diagnostics_summary_path}")
+
     timing_summary = summarize_inference_timing(timing_records)
     timing_summary_path.parent.mkdir(parents=True, exist_ok=True)
     timing_summary_path.write_text(

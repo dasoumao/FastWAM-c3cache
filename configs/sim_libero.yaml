@@ -37,6 +37,11 @@ EVALUATION:
   tiled: false
   compile_action_infer: true
   timing_enabled: true
+  # Optional bounded per-chunk stage diagnostics for compile/cache analysis.
+  inference_diagnostics_enabled: false
+  inference_diagnostics_every_n_chunks: 1
+  inference_diagnostics_max_chunks: 200
+  inference_diagnostics_cuda_events: true
   c3cache_enabled: false
   c3cache_start_step: 0
   c3cache_end_step: 6
