@@ -296,7 +296,18 @@ def _validate_visualize_future_video_cfg(cfg: DictConfig) -> None:
         )
 
 
+def _c3cache_residual_space(cfg: DictConfig) -> str:
+    residual_space = str(cfg.EVALUATION.get("c3cache_residual_space", "hidden")).strip().lower()
+    if residual_space not in ("hidden", "velocity"):
+        raise ValueError(
+            "EVALUATION.c3cache_residual_space must be 'hidden' or 'velocity', "
+            f"got {residual_space!r}."
+        )
+    return residual_space
+
+
 def _c3cache_infer_kwargs(model: torch.nn.Module, cfg: DictConfig) -> dict[str, Any]:
+    residual_space = _c3cache_residual_space(cfg)
     if not bool(cfg.EVALUATION.get("c3cache_enabled", False)):
         return {}
     if bool(cfg.EVALUATION.get("visualize_future_video", False)):
@@ -310,6 +321,7 @@ def _c3cache_infer_kwargs(model: torch.nn.Module, cfg: DictConfig) -> dict[str, 
         "c3cache_start_step",
         "c3cache_end_step",
         "c3cache_refresh_interval",
+        "c3cache_residual_space",
     )
     parameters = inspect.signature(model.infer_action).parameters
     unsupported = [
@@ -333,6 +345,7 @@ def _c3cache_infer_kwargs(model: torch.nn.Module, cfg: DictConfig) -> dict[str, 
         "c3cache_start_step": int(cfg.EVALUATION.get("c3cache_start_step", 0)),
         "c3cache_end_step": int(cfg.EVALUATION.get("c3cache_end_step", 6)),
         "c3cache_refresh_interval": int(cfg.EVALUATION.get("c3cache_refresh_interval", 4)),
+        "c3cache_residual_space": residual_space,
     }
 
 
@@ -682,6 +695,7 @@ def run_single_task(
             "start_step": int(cfg.EVALUATION.get("c3cache_start_step", 0)),
             "end_step": int(cfg.EVALUATION.get("c3cache_end_step", 6)),
             "refresh_interval": int(cfg.EVALUATION.get("c3cache_refresh_interval", 4)),
+            "residual_space": _c3cache_residual_space(cfg),
         },
     }
     timing_enabled = bool(cfg.EVALUATION.get("timing_enabled", False))

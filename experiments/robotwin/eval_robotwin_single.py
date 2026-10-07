@@ -152,6 +152,14 @@ def main(cfg: DictConfig):
         raise ValueError("`ckpt` must not be None.")
     if cfg.EVALUATION.task_name is None:
         raise ValueError("`EVALUATION.task_name` must not be None.")
+    c3cache_residual_space = str(
+        cfg.EVALUATION.get("c3cache_residual_space", "hidden")
+    ).strip().lower()
+    if c3cache_residual_space not in ("hidden", "velocity"):
+        raise ValueError(
+            "EVALUATION.c3cache_residual_space must be 'hidden' or 'velocity', "
+            f"got {c3cache_residual_space!r}."
+        )
 
     ckpt_path = _resolve_path(str(cfg.ckpt), base=PROJECT_ROOT)
     if not ckpt_path.exists():
@@ -224,6 +232,7 @@ def main(cfg: DictConfig):
     _append_override(overrides, "c3cache_start_step", cfg.EVALUATION.c3cache_start_step)
     _append_override(overrides, "c3cache_end_step", cfg.EVALUATION.c3cache_end_step)
     _append_override(overrides, "c3cache_refresh_interval", cfg.EVALUATION.c3cache_refresh_interval)
+    _append_override(overrides, "c3cache_residual_space", c3cache_residual_space)
     _append_override(overrides, "timing_enabled", cfg.EVALUATION.timing_enabled)
     _append_override(
         overrides,

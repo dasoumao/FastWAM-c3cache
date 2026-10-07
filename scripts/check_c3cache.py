@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CACHE = runpy.run_path(str(ROOT / "src/fastwam/models/wan22/c3cache.py"))
 C3Cache = CACHE["C3Cache"]
 validate_c3cache_range = CACHE["validate_c3cache_range"]
+validate_c3cache_residual_space = CACHE["validate_c3cache_residual_space"]
 
 
 def load_tensor_cores():
@@ -44,7 +45,7 @@ class FakeActionExpert:
 
     @staticmethod
     def post(tokens):
-        return 5 * tokens
+        return 5 * tokens + 7
 
 
 class FakeMoT:
@@ -65,19 +66,23 @@ class FakeModel:
         self.mot = FakeMoT()
 
 
-def sample_chunk(model, cache, signature, image_value, interval=4, start=0, end=6, proprio_value=0):
+def sample_chunk(model, cache, signature, image_value, interval=4, start=0, end=6, proprio_value=0,
+                 residual_space="hidden"):
     """A scalar Euler sampler using the actual cache policy and tensor cores."""
-    cache.begin(signature)
+    cache.begin(signature, residual_space=residual_space)
     current = 1.0
     staged = {}
     full = reused = 0
     for step in range(10):
         if cache.should_reuse(step, start, end, interval):
-            prediction = model._denoise_action_c3cache_reuse(current, cache.residuals[step])
+            prediction = model._denoise_action_c3cache_reuse(
+                current, cache.residuals[step], residual_space=residual_space
+            )
             reused += 1
         else:
             prediction, residual = model._denoise_action_c3cache_refresh(
-                current, step, None, None, [image_value + proprio_value], [], None
+                current, step, None, None, [image_value + proprio_value], [], None,
+                residual_space=residual_space,
             )
             if start <= step <= end:
                 staged[step] = residual
@@ -165,9 +170,113 @@ class C3CacheChecks(unittest.TestCase):
         model = FakeModel()
         full, residual = model._denoise_action_c3cache_refresh(2.0, 3, None, None, [10], [], None)
         self.assertEqual(residual, 37)
-        self.assertEqual(full, 5 * ((2 * 2 + 1) + 37))
-        self.assertEqual(model._denoise_action_c3cache_reuse(4.0, residual), 5 * ((2 * 4 + 1) + 37))
+        self.assertEqual(full, 5 * ((2 * 2 + 1) + 37) + 7)
+        self.assertEqual(model._denoise_action_c3cache_reuse(4.0, residual), 5 * ((2 * 4 + 1) + 37) + 7)
         self.assertEqual(model.mot.calls, 1)
+
+    def test_velocity_residual_cancels_head_bias_and_uses_current_input(self):
+        model = FakeModel()
+        full, residual = model._denoise_action_c3cache_refresh(
+            2.0, 3, None, None, [10], [], None, residual_space="velocity"
+        )
+        self.assertEqual(full, 217)
+        self.assertEqual(residual, 185)  # 5 * hidden residual 37, NOT head(37)=192.
+        reused = model._denoise_action_c3cache_reuse(4.0, residual, residual_space="velocity")
+        self.assertEqual(reused, 237)
+        self.assertNotEqual(reused, full)  # Not reusing the previous velocity itself.
+        self.assertEqual(model.mot.calls, 1)  # Reuse skips the DiT.
+
+    def test_velocity_cache_has_action_dimension_with_rectangular_head(self):
+        class Vector(tuple):
+            def __add__(self, other):
+                assert len(self) == len(other)
+                return Vector(a + b for a, b in zip(self, other))
+
+            def __sub__(self, other):
+                assert len(self) == len(other)
+                return Vector(a - b for a, b in zip(self, other))
+
+        def encode(x):
+            return Vector((2 * x[0] + 1, 3 * x[1] - 2, x[0] - x[1]))
+
+        def head(h):
+            return Vector((h[0] + 2 * h[1] - h[2] + 7, 3 * h[0] + h[2] - 4))
+
+        model = FakeModel()
+        model.action_expert = SimpleNamespace(
+            action_encoder=encode, post=head,
+            prepare=lambda action_tokens, **kw: (encode(action_tokens), None, None, None, None, None),
+        )
+        model.mot = SimpleNamespace(
+            forward_action_with_video_cache_tensor=lambda **kw: kw["action_tokens"] + Vector((2, -3, 4)),
+        )
+        inputs = (Vector((1, 2)), 0, None, None, [], [], None)
+        full_h, rh = model._denoise_action_c3cache_refresh(*inputs)
+        full_v, rv = model._denoise_action_c3cache_refresh(*inputs, residual_space="velocity")
+        self.assertEqual(full_h, full_v)
+        self.assertEqual((len(rh), len(rv)), (3, 2))
+        current = Vector((5, -2))
+        self.assertEqual(
+            model._denoise_action_c3cache_reuse(current, rh),
+            model._denoise_action_c3cache_reuse(current, rv, residual_space="velocity"),
+        )
+
+    def test_velocity_matches_hidden_in_affine_scalar_sampler(self):
+        for interval in (0, 1, 4, 8):
+            for start, end in ((0, 6), (2, 4), (0, 9)):
+                with self.subTest(interval=interval, start=start, end=end):
+                    hidden_model, velocity_model = FakeModel(), FakeModel()
+                    hidden_cache, velocity_cache = C3Cache(), C3Cache()
+                    for chunk in range(10):
+                        args = dict(signature=("same",), image_value=chunk,
+                                    proprio_value=chunk * 2, interval=interval, start=start, end=end)
+                        hidden = sample_chunk(hidden_model, hidden_cache, **args)
+                        velocity = sample_chunk(velocity_model, velocity_cache,
+                                                residual_space="velocity", **args)
+                        self.assertAlmostEqual(hidden, velocity)
+                    self.assertEqual(hidden_model.mot.calls, velocity_model.mot.calls)
+                    self.assertEqual(hidden_cache.reused_steps, velocity_cache.reused_steps)
+                    self.assertEqual(velocity_cache.stats()["residual_space"], "velocity")
+
+    def test_residual_space_switch_invalidates_even_with_same_signature(self):
+        model, cache = FakeModel(), C3Cache()
+        sample_chunk(model, cache, ("same",), 10)
+        sample_chunk(model, cache, ("same",), 20)
+        self.assertEqual(cache.reused_steps, 7)
+        sample_chunk(model, cache, ("same",), 30, residual_space="velocity")
+        self.assertEqual((cache.chunk_index, cache.full_steps, cache.reused_steps), (1, 10, 0))
+        self.assertEqual(cache.residuals[0], 5 * (3 * 30 + 1))
+        sample_chunk(model, cache, ("same",), 40)
+        self.assertEqual((cache.chunk_index, cache.full_steps, cache.reused_steps), (1, 10, 0))
+        self.assertEqual(cache.stats()["residual_space"], "hidden")
+        cache.reset()
+        self.assertEqual(cache.residuals, {})
+
+    def test_velocity_tau_one_preserves_full_predictions(self):
+        velocity_model, baseline_model, cache = FakeModel(), FakeModel(), C3Cache()
+        for image in (10, 20, 30):
+            self.assertEqual(
+                sample_chunk(velocity_model, cache, ("same",), image,
+                             interval=1, residual_space="velocity"),
+                full_sample_chunk(baseline_model, image),
+            )
+        self.assertEqual(cache.reused_steps, 0)
+
+    def test_residual_space_validation_and_wiring(self):
+        for mode in ("hidden", "velocity"):
+            validate_c3cache_residual_space(mode)
+        for mode in ("velocty", "", None, 1, True):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                validate_c3cache_residual_space(mode)
+        source = (ROOT / "src/fastwam/models/wan22/fastwam.py").read_text().split("    def infer_action(", 1)[1]
+        signature_body = source.split("c3cache_signature = (", 1)[1].split("timestep_video =", 1)[0]
+        self.assertIn("c3cache_residual_space,", signature_body)
+        tree = ast.parse((ROOT / "src/fastwam/models/wan22/fastwam.py").read_text())
+        for call in ast.walk(tree):
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id in (
+                "c3cache_refresh", "c3cache_reuse",
+            ):
+                self.assertIn("residual_space", [kw.arg for kw in call.keywords])
 
     def test_range_validation(self):
         validate_c3cache_range(10, 0, 9, 0)

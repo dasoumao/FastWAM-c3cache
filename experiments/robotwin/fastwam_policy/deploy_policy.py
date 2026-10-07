@@ -51,6 +51,16 @@ def _parse_bool(value: Any) -> bool:
     raise ValueError(f"Cannot parse bool value: {value}")
 
 
+def _parse_c3cache_residual_space(value: Any) -> str:
+    residual_space = str(value).strip().lower()
+    if residual_space not in ("hidden", "velocity"):
+        raise ValueError(
+            "c3cache_residual_space must be 'hidden' or 'velocity', "
+            f"got {residual_space!r}."
+        )
+    return residual_space
+
+
 def _parse_optional_int(value: Any) -> Optional[int]:
     if _is_none_like(value):
         return None
@@ -142,6 +152,7 @@ def _validate_c3cache_support(model: torch.nn.Module) -> None:
         "c3cache_start_step",
         "c3cache_end_step",
         "c3cache_refresh_interval",
+        "c3cache_residual_space",
     )
     parameters = inspect.signature(model.infer_action).parameters
     unsupported = [
@@ -187,10 +198,12 @@ class WorldActionRobotWinPolicy:
         c3cache_start_step: int = 0,
         c3cache_end_step: int = 6,
         c3cache_refresh_interval: int = 4,
+        c3cache_residual_space: str = "hidden",
         timing_output_dir: Optional[Path] = None,
         task_name: Optional[str] = None,
         task_config: Optional[str] = None,
     ) -> None:
+        c3cache_residual_space = _parse_c3cache_residual_space(c3cache_residual_space)
         model_cfg_copy = OmegaConf.create(OmegaConf.to_container(model_cfg, resolve=True))
         model_cfg_copy.load_text_encoder = True
 
@@ -218,6 +231,7 @@ class WorldActionRobotWinPolicy:
         self.c3cache_start_step = int(c3cache_start_step)
         self.c3cache_end_step = int(c3cache_end_step)
         self.c3cache_refresh_interval = int(c3cache_refresh_interval)
+        self.c3cache_residual_space = c3cache_residual_space
         self.timing_enabled = bool(timing_enabled)
         self.task_name = task_name
         self.task_config = task_config
@@ -312,6 +326,7 @@ class WorldActionRobotWinPolicy:
                 c3cache_start_step=self.c3cache_start_step,
                 c3cache_end_step=self.c3cache_end_step,
                 c3cache_refresh_interval=self.c3cache_refresh_interval,
+                c3cache_residual_space=self.c3cache_residual_space,
             )
         infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
@@ -332,6 +347,7 @@ class WorldActionRobotWinPolicy:
                     "start_step": self.c3cache_start_step,
                     "end_step": self.c3cache_end_step,
                     "refresh_interval": self.c3cache_refresh_interval,
+                    "residual_space": self.c3cache_residual_space,
                 },
             }
             if self.c3cache_enabled:
@@ -457,6 +473,12 @@ def get_model(usr_args: Dict[str, Any]):
     c3cache_enabled = _parse_bool(
         usr_args.get("c3cache_enabled", cfg.EVALUATION.get("c3cache_enabled", False))
     )
+    c3cache_residual_space = _parse_c3cache_residual_space(
+        usr_args.get(
+            "c3cache_residual_space",
+            cfg.EVALUATION.get("c3cache_residual_space", "hidden"),
+        )
+    )
     c3cache_start_step = int(
         usr_args.get("c3cache_start_step", cfg.EVALUATION.get("c3cache_start_step", 0))
     )
@@ -490,6 +512,7 @@ def get_model(usr_args: Dict[str, Any]):
         c3cache_start_step=c3cache_start_step,
         c3cache_end_step=c3cache_end_step,
         c3cache_refresh_interval=c3cache_refresh_interval,
+        c3cache_residual_space=c3cache_residual_space,
         timing_enabled=timing_enabled,
         timing_output_dir=(
             Path(str(usr_args["eval_output_dir"]))

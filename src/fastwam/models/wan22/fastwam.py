@@ -9,7 +9,7 @@ from PIL import Image
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
-from .c3cache import C3Cache, validate_c3cache_range
+from .c3cache import C3Cache, validate_c3cache_range, validate_c3cache_residual_space
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -774,8 +774,9 @@ class FastWAM(torch.nn.Module):
         video_cache_k: list[torch.Tensor],
         video_cache_v: list[torch.Tensor],
         action_attention_mask: torch.Tensor,
+        residual_space: str = "hidden",
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Run the full action stack and return its residual over input tokens."""
+        """Return the full velocity and a hidden- or velocity-space residual."""
         (
             action_tokens,
             _t,
@@ -799,17 +800,26 @@ class FastWAM(torch.nn.Module):
             video_cache_v=video_cache_v,
             action_attention_mask=action_attention_mask,
         )
-        # Use full_tokens directly for this step. Reconstructing it from the
-        # residual would add an avoidable rounding difference on refresh.
-        return self.action_expert.post(full_tokens), full_tokens - action_tokens
+        # Keep the actual full prediction on refresh; reconstructing it from
+        # the residual would introduce an avoidable rounding difference.
+        full_velocity = self.action_expert.post(full_tokens)
+        if residual_space == "velocity":
+            # R_v = head(h_L) - head(h_0). The head bias cancels; using
+            # head(h_L - h_0) would incorrectly include that bias.
+            return full_velocity, full_velocity - self.action_expert.post(action_tokens)
+        return full_velocity, full_tokens - action_tokens
 
     def _denoise_action_c3cache_reuse(
         self,
         latents_action: torch.Tensor,
         residual: torch.Tensor,
+        residual_space: str = "hidden",
     ) -> torch.Tensor:
         # The current noisy action, not the image, supplies the input tokens.
-        return self.action_expert.post(self.action_expert.action_encoder(latents_action) + residual)
+        action_tokens = self.action_expert.action_encoder(latents_action)
+        if residual_space == "velocity":
+            return self.action_expert.post(action_tokens) + residual
+        return self.action_expert.post(action_tokens + residual)
 
     @torch.no_grad()
     def _predict_action_noise_with_cache(
@@ -1072,7 +1082,9 @@ class FastWAM(torch.nn.Module):
         c3cache_start_step: int = 0,
         c3cache_end_step: int = 6,
         c3cache_refresh_interval: int = 4,
+        c3cache_residual_space: str = "hidden",
     ) -> dict[str, Any]:
+        validate_c3cache_residual_space(c3cache_residual_space)
         if c3cache_enabled:
             if type(self) is not FastWAM:
                 raise ValueError("C3ache is supported only by the base FastWAM action sampler.")
@@ -1189,6 +1201,7 @@ class FastWAM(torch.nn.Module):
                 c3cache_start_step,
                 c3cache_end_step,
                 c3cache_refresh_interval,
+                c3cache_residual_space,
                 tuple(context.shape),
                 tuple(context_mask.shape),
                 c3cache_context_identity,
@@ -1286,7 +1299,7 @@ class FastWAM(torch.nn.Module):
             shift_override=sigma_shift,
         )
         if c3cache_enabled:
-            self._c3cache.begin(c3cache_signature)
+            self._c3cache.begin(c3cache_signature, residual_space=c3cache_residual_space)
         staged_residuals: dict[int, torch.Tensor] = {}
         full_steps = reused_steps = 0
         try:
@@ -1306,6 +1319,7 @@ class FastWAM(torch.nn.Module):
                     pred_action = c3cache_reuse(
                         latents_action=latents_action,
                         residual=self._c3cache.residuals[step_index],
+                        residual_space=c3cache_residual_space,
                     )
                     reused_steps += 1
                 elif c3cache_enabled and c3cache_start_step <= step_index <= c3cache_end_step:
@@ -1317,6 +1331,7 @@ class FastWAM(torch.nn.Module):
                         video_cache_k=video_cache_k,
                         video_cache_v=video_cache_v,
                         action_attention_mask=action_attention_mask,
+                        residual_space=c3cache_residual_space,
                     )
                     # Compiled reduce-overhead outputs may be overwritten on graph
                     # replay, so persistent residuals always own their storage.
