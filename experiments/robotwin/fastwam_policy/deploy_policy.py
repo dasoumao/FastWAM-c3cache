@@ -27,7 +27,6 @@ if str(SRC_ROOT) not in sys.path:
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
-from fastwam.inference_timing import InferenceTimer
 
 logger = logging.getLogger(__name__)
 
@@ -188,11 +187,6 @@ class WorldActionRobotWinPolicy:
         c3cache_start_step: int = 0,
         c3cache_end_step: int = 6,
         c3cache_refresh_interval: int = 4,
-        compile_action_infer: bool = False,
-        inference_diagnostics_enabled: bool = False,
-        inference_diagnostics_every_n_chunks: int = 1,
-        inference_diagnostics_max_chunks: int = 200,
-        inference_diagnostics_cuda_events: bool = True,
         timing_output_dir: Optional[Path] = None,
         task_name: Optional[str] = None,
         task_config: Optional[str] = None,
@@ -203,36 +197,9 @@ class WorldActionRobotWinPolicy:
         self.model = instantiate(model_cfg_copy, model_dtype=model_dtype, device=device)
         self.model.load_checkpoint(checkpoint_path)
         self.model = self.model.to(device).eval()
-        if compile_action_infer:
-            compile_parameter = inspect.signature(self.model.infer_action).parameters.get(
-                "compile_action_infer"
-            )
-            if compile_parameter is None or compile_parameter.kind not in (
-                inspect.Parameter.POSITIONAL_OR_KEYWORD,
-                inspect.Parameter.KEYWORD_ONLY,
-            ):
-                raise ValueError(
-                    "compile_action_infer=true requires infer_action to accept "
-                    "the compile_action_infer keyword."
-                )
         if c3cache_enabled:
             _validate_c3cache_support(self.model)
             self.model.reset_c3cache()
-        if inference_diagnostics_enabled:
-            configure_diagnostics = getattr(self.model, "configure_inference_diagnostics", None)
-            if not callable(configure_diagnostics) or not callable(
-                getattr(self.model, "get_inference_diagnostics", None)
-            ):
-                raise ValueError(
-                    "inference_diagnostics_enabled=true requires a model with "
-                    "configure_inference_diagnostics() and get_inference_diagnostics()."
-                )
-            configure_diagnostics(
-                enabled=True,
-                every_n_chunks=int(inference_diagnostics_every_n_chunks),
-                max_chunks=int(inference_diagnostics_max_chunks),
-                cuda_events=bool(inference_diagnostics_cuda_events),
-            )
 
         self.processor: FastWAMProcessor = instantiate(processor_cfg).eval()
         dataset_stats = load_dataset_stats_from_json(str(dataset_stats_path))
@@ -251,10 +218,7 @@ class WorldActionRobotWinPolicy:
         self.c3cache_start_step = int(c3cache_start_step)
         self.c3cache_end_step = int(c3cache_end_step)
         self.c3cache_refresh_interval = int(c3cache_refresh_interval)
-        self.compile_action_infer = bool(compile_action_infer)
         self.timing_enabled = bool(timing_enabled)
-        self.inference_diagnostics_enabled = bool(inference_diagnostics_enabled)
-        self._diagnostics_max_chunks = int(inference_diagnostics_max_chunks)
         self.task_name = task_name
         self.task_config = task_config
         timing_tag = "".join(
@@ -265,23 +229,12 @@ class WorldActionRobotWinPolicy:
             Path(timing_output_dir) / f"fastwam_inference_timing_{timing_tag}.jsonl"
             if timing_output_dir is not None else None
         )
-        self._diagnostics_output_path = (
-            Path(timing_output_dir) / f"fastwam_inference_diagnostics_{timing_tag}.jsonl"
-            if timing_output_dir is not None else None
-        )
-        self._diagnostic_records_written = 0
         self._num_video_frames = int(num_video_frames)
 
         self.pending_actions: deque[np.ndarray] = deque()
         self.episode_count = 0
         self.step_count = 0
-        self._timing_rollout = {
-            "infer_s": 0.0,
-            "infer_cuda_s": 0.0,
-            "sim_s": 0.0,
-            "infer_chunks": 0,
-            "infer_cuda_chunks": 0,
-        }
+        self._timing_rollout = {"infer_s": 0.0, "sim_s": 0.0, "infer_chunks": 0}
 
         logger.info(
             "Initialized WorldActionRobotWinPolicy | ckpt=%s | stats=%s | horizon=%d | replan=%d",
@@ -353,8 +306,6 @@ class WorldActionRobotWinPolicy:
         }
         if "num_video_frames" in inspect.signature(self.model.infer_action).parameters:
             infer_kwargs["num_video_frames"] = int(self._num_video_frames)
-        if self.compile_action_infer:
-            infer_kwargs["compile_action_infer"] = True
         if self.c3cache_enabled:
             infer_kwargs.update(
                 c3cache_enabled=True,
@@ -362,50 +313,20 @@ class WorldActionRobotWinPolicy:
                 c3cache_end_step=self.c3cache_end_step,
                 c3cache_refresh_interval=self.c3cache_refresh_interval,
             )
+        infer_t0 = time.perf_counter() if self.timing_enabled else 0.0
         with torch.no_grad():
-            with InferenceTimer(device=self.model.device, enabled=self.timing_enabled) as timer:
-                pred = self.model.infer_action(**infer_kwargs)
-        if (
-            self.inference_diagnostics_enabled
-            and self._diagnostic_records_written < self._diagnostics_max_chunks
-        ):
-            diagnostic_snapshot = self.model.get_inference_diagnostics()
-            new_records = diagnostic_snapshot["records"][self._diagnostic_records_written:]
-            if new_records:
-                first_record = self._diagnostic_records_written == 0
-                self._diagnostic_records_written += len(new_records)
-                output_records = [dict(record) for record in new_records]
-                if first_record:
-                    output_records[0]["_task_metadata"] = diagnostic_snapshot["metadata"]
-                if self._diagnostics_output_path is None:
-                    for record in output_records:
-                        print(f"FastWAM inference diagnostics: {json.dumps(record)}", flush=True)
-                else:
-                    self._diagnostics_output_path.parent.mkdir(parents=True, exist_ok=True)
-                    with self._diagnostics_output_path.open("a", encoding="utf-8") as diagnostics_file:
-                        for record in output_records:
-                            diagnostics_file.write(json.dumps(record) + "\n")
+            pred = self.model.infer_action(**infer_kwargs)
         if self.timing_enabled:
-            infer_s = timer.wall_seconds
-            infer_cuda_s = timer.cuda_seconds
-            assert infer_s is not None
+            infer_s = time.perf_counter() - infer_t0
             self._timing_rollout["infer_s"] += infer_s
             self._timing_rollout["infer_chunks"] += 1
-            if infer_cuda_s is not None:
-                self._timing_rollout["infer_cuda_s"] += infer_cuda_s
-                self._timing_rollout["infer_cuda_chunks"] += 1
             timing_record = {
                 "task_name": self.task_name,
                 "task_config": self.task_config,
                 "episode": self.episode_count,
                 "chunk": self._timing_rollout["infer_chunks"],
                 "infer_s": infer_s,
-                "infer_cuda_s": infer_cuda_s,
                 "cumulative_infer_s": self._timing_rollout["infer_s"],
-                "cumulative_infer_cuda_s": (
-                    self._timing_rollout["infer_cuda_s"] if infer_cuda_s is not None else None
-                ),
-                "cumulative_infer_cuda_chunks": self._timing_rollout["infer_cuda_chunks"],
                 "c3cache": {
                     "enabled": self.c3cache_enabled,
                     "start_step": self.c3cache_start_step,
@@ -460,21 +381,14 @@ class WorldActionRobotWinPolicy:
 
     def reset_timing_rollout(self) -> None:
         self._timing_rollout["infer_s"] = 0.0
-        self._timing_rollout["infer_cuda_s"] = 0.0
         self._timing_rollout["sim_s"] = 0.0
         self._timing_rollout["infer_chunks"] = 0
-        self._timing_rollout["infer_cuda_chunks"] = 0
 
-    def get_timing_rollout(self) -> Dict[str, float | int | None]:
+    def get_timing_rollout(self) -> Dict[str, float | int]:
         return {
             "infer_s": float(self._timing_rollout["infer_s"]),
-            "infer_cuda_s": (
-                float(self._timing_rollout["infer_cuda_s"])
-                if self._timing_rollout["infer_cuda_chunks"] else None
-            ),
             "sim_s": float(self._timing_rollout["sim_s"]),
             "infer_chunks": int(self._timing_rollout["infer_chunks"]),
-            "infer_cuda_chunks": int(self._timing_rollout["infer_cuda_chunks"]),
         }
 
     def reset(self) -> None:
@@ -482,14 +396,6 @@ class WorldActionRobotWinPolicy:
         if self.c3cache_enabled:
             self.model.reset_c3cache()
         self.episode_count += 1
-        if self.inference_diagnostics_enabled:
-            context_fn = getattr(self.model, "set_inference_diagnostic_context", None)
-            if callable(context_fn):
-                context_fn(
-                    task_name=self.task_name,
-                    task_config=self.task_config,
-                    episode_index=self.episode_count,
-                )
         self.step_count = 0
         self.reset_timing_rollout()
 
@@ -551,9 +457,6 @@ def get_model(usr_args: Dict[str, Any]):
     c3cache_enabled = _parse_bool(
         usr_args.get("c3cache_enabled", cfg.EVALUATION.get("c3cache_enabled", False))
     )
-    compile_action_infer = _parse_bool(
-        usr_args.get("compile_action_infer", cfg.EVALUATION.get("compile_action_infer", False))
-    )
     c3cache_start_step = int(
         usr_args.get("c3cache_start_step", cfg.EVALUATION.get("c3cache_start_step", 0))
     )
@@ -564,31 +467,7 @@ def get_model(usr_args: Dict[str, Any]):
         usr_args.get("c3cache_refresh_interval", cfg.EVALUATION.get("c3cache_refresh_interval", 4))
     )
     timing_enabled = _parse_bool(
-        usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", True))
-    )
-    inference_diagnostics_enabled = _parse_bool(
-        usr_args.get(
-            "inference_diagnostics_enabled",
-            cfg.EVALUATION.get("inference_diagnostics_enabled", False),
-        )
-    )
-    inference_diagnostics_every_n_chunks = int(
-        usr_args.get(
-            "inference_diagnostics_every_n_chunks",
-            cfg.EVALUATION.get("inference_diagnostics_every_n_chunks", 1),
-        )
-    )
-    inference_diagnostics_max_chunks = int(
-        usr_args.get(
-            "inference_diagnostics_max_chunks",
-            cfg.EVALUATION.get("inference_diagnostics_max_chunks", 200),
-        )
-    )
-    inference_diagnostics_cuda_events = _parse_bool(
-        usr_args.get(
-            "inference_diagnostics_cuda_events",
-            cfg.EVALUATION.get("inference_diagnostics_cuda_events", True),
-        )
+        usr_args.get("timing_enabled", cfg.EVALUATION.get("timing_enabled", False))
     )
 
     policy = WorldActionRobotWinPolicy(
@@ -611,12 +490,7 @@ def get_model(usr_args: Dict[str, Any]):
         c3cache_start_step=c3cache_start_step,
         c3cache_end_step=c3cache_end_step,
         c3cache_refresh_interval=c3cache_refresh_interval,
-        compile_action_infer=compile_action_infer,
         timing_enabled=timing_enabled,
-        inference_diagnostics_enabled=inference_diagnostics_enabled,
-        inference_diagnostics_every_n_chunks=inference_diagnostics_every_n_chunks,
-        inference_diagnostics_max_chunks=inference_diagnostics_max_chunks,
-        inference_diagnostics_cuda_events=inference_diagnostics_cuda_events,
         timing_output_dir=(
             Path(str(usr_args["eval_output_dir"]))
             if not _is_none_like(usr_args.get("eval_output_dir")) else None

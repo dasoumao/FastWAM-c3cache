@@ -38,7 +38,6 @@ from experiments.libero.worker_pool import pop_task, write_worker_status
 from fastwam.datasets.lerobot.processors.fastwam_processor import FastWAMProcessor
 from fastwam.datasets.lerobot.utils.normalizer import load_dataset_stats_from_json
 from fastwam.utils.pytorch_utils import set_global_seed
-from fastwam.inference_timing import InferenceTimer, summarize_inference_timing
 from fastwam.datasets.lerobot.robot_video_dataset import DEFAULT_PROMPT
 from libero.libero import benchmark, get_libero_path
 from action_ensembler import ActionEnsembler
@@ -471,29 +470,23 @@ def _predict_action_chunk(
             f"{type(model).__name__}.{infer_method.__name__} does not support `compile_action_infer`."
         )
 
-    timing_enabled = bool(cfg.EVALUATION.get("timing_enabled", True))
+    timing_enabled = bool(cfg.EVALUATION.get("timing_enabled", False))
+    infer_t0 = time.perf_counter() if timing_enabled else 0.0
     with torch.no_grad():
-        with InferenceTimer(device=model_device, enabled=timing_enabled) as timer:
-            if visualize_future_video:
-                pred = model.infer_joint(
-                    **infer_kwargs,
-                    compile_action_infer=compile_action_infer,
-                )
-            else:
-                pred = model.infer_action(
-                    **infer_kwargs,
-                    compile_action_infer=compile_action_infer,
-                )
-    if visualize_future_video:
-        predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
-    if timing_enabled and episode_metrics is not None:
-        episode_metrics["inference_seconds"] += timer.wall_seconds
-        episode_metrics["inference_chunks"] += 1
-        if timer.cuda_seconds is not None:
-            episode_metrics["inference_cuda_seconds"] = (
-                (episode_metrics["inference_cuda_seconds"] or 0.0) + timer.cuda_seconds
+        if visualize_future_video:
+            pred = model.infer_joint(
+                **infer_kwargs,
+                compile_action_infer=compile_action_infer,
             )
-            episode_metrics["inference_cuda_chunks"] += 1
+            predicted_future_frames = _select_predicted_future_frames(pred["video"], cfg)
+        else:
+            pred = model.infer_action(
+                **infer_kwargs,
+                compile_action_infer=compile_action_infer,
+            )
+    if timing_enabled and episode_metrics is not None:
+        episode_metrics["infer_s"] += time.perf_counter() - infer_t0
+        episode_metrics["infer_chunks"] += 1
     action = pred["action"]  # [T, D]
 
     action = _denormalize_action(action, processor)[0]  # [T, D]
@@ -542,16 +535,6 @@ def run_single_episode(
     visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     capture_steps = set(_get_future_frame_capture_steps(cfg)[1:])
 
-    diagnostic_context_fn = getattr(model, "set_inference_diagnostic_context", None)
-    if (
-        bool(cfg.EVALUATION.get("inference_diagnostics_enabled", False))
-        and callable(diagnostic_context_fn)
-    ):
-        diagnostic_context_fn(
-            task_suite_name=str(cfg.EVALUATION.task_suite_name),
-            task_id=int(cfg.EVALUATION.task_id),
-            episode_index=episode_idx,
-        )
     if _c3cache_infer_kwargs(model, cfg):
         model.reset_c3cache()
     env.reset()
@@ -687,31 +670,8 @@ def run_single_task(
     input_h: int,
     model_device: str,
 ) -> dict:
-    visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
-    diagnostics_enabled = bool(cfg.EVALUATION.get("inference_diagnostics_enabled", False))
-    configure_diagnostics = getattr(model, "configure_inference_diagnostics", None)
-    if diagnostics_enabled:
-        if visualize_future_video:
-            raise ValueError(
-                "EVALUATION.inference_diagnostics_enabled=true requires infer_action; "
-                "visualize_future_video uses infer_joint."
-            )
-        get_diagnostics = getattr(model, "get_inference_diagnostics", None)
-        if not callable(configure_diagnostics) or not callable(get_diagnostics):
-            raise ValueError(
-                "EVALUATION.inference_diagnostics_enabled=true requires a model with "
-                "configure_inference_diagnostics() and get_inference_diagnostics()."
-            )
-        configure_diagnostics(
-            enabled=True,
-            every_n_chunks=int(cfg.EVALUATION.get("inference_diagnostics_every_n_chunks", 1)),
-            max_chunks=int(cfg.EVALUATION.get("inference_diagnostics_max_chunks", 200)),
-            cuda_events=bool(cfg.EVALUATION.get("inference_diagnostics_cuda_events", True)),
-        )
-    elif callable(configure_diagnostics):
-        # Persistent workers reuse the same model for multiple tasks.
-        configure_diagnostics(enabled=False)
     env, task_description = get_libero_env(task, LIBERO_ENV_RESOLUTION, cfg.get("seed"))
+    visualize_future_video = bool(cfg.EVALUATION.get("visualize_future_video", False))
     results = {
         "successes": 0,
         "failure_episodes": [],
@@ -724,16 +684,12 @@ def run_single_task(
             "refresh_interval": int(cfg.EVALUATION.get("c3cache_refresh_interval", 4)),
         },
     }
-    timing_enabled = bool(cfg.EVALUATION.get("timing_enabled", True))
+    timing_enabled = bool(cfg.EVALUATION.get("timing_enabled", False))
     if timing_enabled:
         results["inference_seconds"] = 0.0
         results["inference_chunks"] = 0
-        results["inference_cuda_seconds"] = None
-        results["inference_cuda_chunks"] = 0
         results["episode_inference_seconds"] = []
         results["episode_inference_chunks"] = []
-        results["episode_inference_cuda_seconds"] = []
-        results["episode_inference_cuda_chunks"] = []
     cache_stats_fn = getattr(model, "get_c3cache_stats", None)
     if results["c3cache"]["enabled"] and callable(cache_stats_fn):
         results["episode_c3cache_stats"] = []
@@ -742,16 +698,7 @@ def run_single_task(
         results["future_video_psnr_mean"] = None
 
     for trial_idx in range(int(cfg.EVALUATION.num_trials)):
-        episode_metrics = (
-            {
-                "inference_seconds": 0.0,
-                "inference_chunks": 0,
-                "inference_cuda_seconds": None,
-                "inference_cuda_chunks": 0,
-            }
-            if timing_enabled
-            else None
-        )
+        episode_metrics = {"infer_s": 0.0, "infer_chunks": 0} if timing_enabled else None
         success, replay_images, predicted_future_video_clips, episode_mean_psnr = run_single_episode(
             env=env,
             initial_state=initial_states[trial_idx],
@@ -767,22 +714,10 @@ def run_single_task(
             episode_metrics=episode_metrics,
         )
         if episode_metrics is not None:
-            results["inference_seconds"] += episode_metrics["inference_seconds"]
-            results["inference_chunks"] += episode_metrics["inference_chunks"]
-            if episode_metrics["inference_cuda_seconds"] is not None:
-                results["inference_cuda_seconds"] = (
-                    (results["inference_cuda_seconds"] or 0.0)
-                    + episode_metrics["inference_cuda_seconds"]
-                )
-                results["inference_cuda_chunks"] += episode_metrics["inference_cuda_chunks"]
-            results["episode_inference_seconds"].append(episode_metrics["inference_seconds"])
-            results["episode_inference_chunks"].append(episode_metrics["inference_chunks"])
-            results["episode_inference_cuda_seconds"].append(
-                episode_metrics["inference_cuda_seconds"]
-            )
-            results["episode_inference_cuda_chunks"].append(
-                episode_metrics["inference_cuda_chunks"]
-            )
+            results["inference_seconds"] += episode_metrics["infer_s"]
+            results["inference_chunks"] += episode_metrics["infer_chunks"]
+            results["episode_inference_seconds"].append(episode_metrics["infer_s"])
+            results["episode_inference_chunks"].append(episode_metrics["infer_chunks"])
         if "episode_c3cache_stats" in results:
             results["episode_c3cache_stats"].append(cache_stats_fn())
         if success:
@@ -840,10 +775,6 @@ def run_single_task(
         valid_episode_psnr = [x for x in results["episode_future_video_psnr"] if x is not None]
         if len(valid_episode_psnr) > 0:
             results["future_video_psnr_mean"] = float(np.mean(valid_episode_psnr))
-    if timing_enabled:
-        results.update(summarize_inference_timing([results]))
-    if diagnostics_enabled:
-        results["inference_diagnostics"] = get_diagnostics()
     return results
 
 
@@ -1089,20 +1020,6 @@ def eval_single_process(cfg: DictConfig):
     )
     if results.get("future_video_psnr_mean") is not None:
         print(f"Task {cfg.EVALUATION.task_id} future-video PSNR mean: {results['future_video_psnr_mean']:.4f}")
-    wall_ms = results.get("inference_ms_per_chunk")
-    cuda_ms = results.get("inference_cuda_ms_per_chunk")
-    print(
-        f"Inference wall: {results['inference_seconds']:.3f} s across "
-        f"{results['inference_chunks']} chunks ({wall_ms:.3f} ms/chunk)"
-        if wall_ms is not None
-        else "Inference wall: N/A"
-    )
-    print(
-        f"Inference CUDA: {results['inference_cuda_seconds']:.3f} s across "
-        f"{results['inference_cuda_chunks']} chunks ({cuda_ms:.3f} ms/chunk)"
-        if cuda_ms is not None
-        else "Inference CUDA: N/A"
-    )
     print(f"Time taken: {results['duration']:.2f} seconds")
     return results
 

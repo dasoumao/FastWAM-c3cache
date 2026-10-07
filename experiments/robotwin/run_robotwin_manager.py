@@ -16,24 +16,10 @@ from hydra.core.hydra_config import HydraConfig
 from omegaconf import DictConfig
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
-
-from fastwam.inference_timing import summarize_inference_timing
-
 SINGLE_ENTRY = PROJECT_ROOT / "experiments" / "robotwin" / "eval_robotwin_single.py"
 EVAL_STEP_LIMIT_FILE = PROJECT_ROOT / "third_party" / "RoboTwin" / "task_config" / "_eval_step_limit.yml"
 TERMINATE_TIMEOUT_SEC = 10
 POLL_INTERVAL_SEC = 2
-TIMING_FIELDS = (
-    "inference_seconds",
-    "inference_chunks",
-    "inference_cuda_seconds",
-    "inference_cuda_chunks",
-    "inference_ms_per_chunk",
-    "inference_cuda_ms_per_chunk",
-)
 
 
 def _resolve_path(path_str: str, *, base: Path) -> Path:
@@ -136,38 +122,6 @@ def _to_jsonable(value: float | None) -> float | None:
     return float(value)
 
 
-def _phase_timing_summary(task_dir: Path, task_config: str) -> dict[str, float | int | None]:
-    tag = "".join(
-        char if char.isalnum() or char in "_-" else "_" for char in task_config
-    )
-    path = task_dir / f"fastwam_inference_summary_{tag}.json"
-    if not path.exists():
-        return summarize_inference_timing([])
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict):
-            raise ValueError("expected a JSON object")
-        return summarize_inference_timing([payload])
-    except (OSError, ValueError, TypeError) as exc:
-        print(f"Warning: cannot read inference timing summary {path}: {exc}", file=sys.stderr)
-        return summarize_inference_timing([])
-
-
-def _prefixed_timing(phase: str, timing: dict[str, float | int | None]) -> dict[str, float | int | None]:
-    return {f"{phase}_{key}": timing[key] for key in TIMING_FIELDS}
-
-
-def _format_timing(timing: dict[str, float | int | None]) -> str:
-    wall = timing["inference_ms_per_chunk"]
-    cuda = timing["inference_cuda_ms_per_chunk"]
-    cuda_s = timing["inference_cuda_seconds"]
-    return (
-        f"wall={'N/A' if wall is None else f'{wall:.3f} ms/chunk'} "
-        f"CUDA={'N/A' if cuda is None or cuda_s is None else f'{cuda:.3f} ms/chunk ({cuda_s:.3f} s total)'} "
-        f"chunks={timing['inference_chunks']}"
-    )
-
-
 @dataclass
 class RunningState:
     task_name: str
@@ -222,13 +176,6 @@ def main(cfg: DictConfig):
 
     task_rates: dict[str, dict[str, float | None]] = {
         task: {"clean": None, "random": None} for task in tasks
-    }
-    task_timings: dict[str, dict[str, dict[str, float | int | None]]] = {
-        task: {
-            "clean": summarize_inference_timing([]),
-            "random": summarize_inference_timing([]),
-        }
-        for task in tasks
     }
     failed_records: list[dict[str, Any]] = []
     pending_tasks = deque(tasks)
@@ -314,54 +261,18 @@ def main(cfg: DictConfig):
         clean_mean = _mean_or_none([task_rates[t]["clean"] for t in tasks])
         random_mean = _mean_or_none([task_rates[t]["random"] for t in tasks])
 
-        def row_timing(task: str) -> dict[str, float | int | None]:
-            clean = task_timings[task]["clean"]
-            random = task_timings[task]["random"]
-            return {
-                **_prefixed_timing("clean", clean),
-                **_prefixed_timing("random", random),
-                **summarize_inference_timing([clean, random]),
-            }
-
-        clean_overall = summarize_inference_timing(
-            [task_timings[t]["clean"] for t in tasks if task_rates[t]["clean"] is not None]
-        )
-        random_overall = summarize_inference_timing(
-            [task_timings[t]["random"] for t in tasks if task_rates[t]["random"] is not None]
-        )
-        overall_timing = {
-            **_prefixed_timing("clean", clean_overall),
-            **_prefixed_timing("random", random_overall),
-            **summarize_inference_timing([clean_overall, random_overall]),
-        }
-        timing_columns = [
-            *(f"clean_{key}" for key in TIMING_FIELDS),
-            *(f"random_{key}" for key in TIMING_FIELDS),
-            *TIMING_FIELDS,
-        ]
-
         with summary_csv.open("w", encoding="utf-8", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([
-                "task_name", "clean_success_rate", "random_success_rate", *timing_columns
-            ])
+            writer.writerow(["task_name", "clean_success_rate", "random_success_rate"])
             for task in tasks:
-                timing = row_timing(task)
                 writer.writerow(
                     [
                         task,
                         task_rates[task]["clean"],
                         task_rates[task]["random"],
-                        *(timing[key] if timing[key] is not None else "N/A" for key in timing_columns),
                     ]
                 )
-            writer.writerow([
-                "__overall__", clean_mean, random_mean,
-                *(
-                    overall_timing[key] if overall_timing[key] is not None else "N/A"
-                    for key in timing_columns
-                ),
-            ])
+            writer.writerow(["__overall__", clean_mean, random_mean])
 
         payload = {
             "per_task": [
@@ -369,14 +280,12 @@ def main(cfg: DictConfig):
                     "task_name": task,
                     "clean_success_rate": _to_jsonable(task_rates[task]["clean"]),
                     "random_success_rate": _to_jsonable(task_rates[task]["random"]),
-                    **row_timing(task),
                 }
                 for task in tasks
             ],
             "overall": {
                 "clean_mean_success_rate": _to_jsonable(clean_mean),
                 "random_mean_success_rate": _to_jsonable(random_mean),
-                **overall_timing,
             },
         }
         summary_json.write_text(
@@ -457,14 +366,9 @@ def main(cfg: DictConfig):
                 break
 
             task_rates[state.task_name][state.phase] = success_rate
-            task_config = phase_to_task_config[state.phase]
-            task_timings[state.task_name][state.phase] = _phase_timing_summary(
-                run_output_dir / state.task_name, task_config
-            )
             log(
                 f"done task={state.task_name} phase={state.phase} gpu={gpu_id} "
-                f"success_rate={success_rate:.4f} "
-                f"{_format_timing(task_timings[state.task_name][state.phase])}"
+                f"success_rate={success_rate:.4f}"
             )
 
             if state.phase == "clean":
@@ -497,12 +401,6 @@ def main(cfg: DictConfig):
 
     write_outputs()
     log(f"summary saved: {summary_csv} and {summary_json}")
-    completed_timing = summarize_inference_timing([
-        task_timings[task][phase]
-        for task in tasks for phase in ("clean", "random")
-        if task_rates[task][phase] is not None
-    ])
-    log(f"overall inference timing: {_format_timing(completed_timing)}")
 
     if has_failure:
         raise RuntimeError(failure_message)

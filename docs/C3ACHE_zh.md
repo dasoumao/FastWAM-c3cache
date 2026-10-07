@@ -118,7 +118,6 @@ python experiments/robotwin/eval_robotwin_single.py \
 
 ```bash
 python scripts/check_c3cache.py
-python scripts/check_inference_timing.py
 git diff --check
 ```
 
@@ -136,31 +135,6 @@ LIBERO 默认开启 `torch.compile`，本说明的起始验收命令先用 eager
 
 评测程序运行总时长包括环境交互、视频保存等，不能直接作为模型 inference speedup。应分别报告 `sum(baseline inference seconds) / sum(cache inference seconds)`、每 chunk 延迟和成功率；成功率或 episode 长度变化会影响总推理调用数。
 
-LIBERO 和 RoboTwin 的 `EVALUATION.timing_enabled` 现在默认是 `true`；继续使用原有单任务/manager 评测命令即可输出额外计时。可设为 `false` 关闭计时及新增的 CUDA 同步。
-
-计时覆盖完整模型调用直至 action 返回 CPU，包括文本编码、VAE、video prefill、action 去噪、head 和 scheduler；不含外围图像预处理、action 反归一化、仿真交互、视频保存或指标写盘。原来的任务 `duration` 和成功率继续保留。
-
-共享实现为 `src/fastwam/inference_timing.py`：进入模型调用前同步指定 CUDA device，排除已经排队的观测预处理/仿真工作；在该 device 的当前 stream 上记录一对 `torch.cuda.Event(enable_timing=True)`，等待结束 event 完成后读取 `elapsed_time`，把毫秒转换为秒。同步完成的 wall time 也同时保留。CPU 推理只产生 wall time，CUDA 字段是 `null`，报告显示 N/A。接口依据 [PyTorch 2.7 CUDA Event 文档](https://docs.pytorch.org/docs/2.7/generated/torch.cuda.Event.html)。
-
-**CUDA Event 字段表示模型调用区间在 CUDA stream 上的经过时间，不是所有 kernel 耗时之和。** 模型调用期间的 CPU 提交间隙、首次编译和 GPU 等待可能落在两个 event 之间。当前模型在返回 CPU action 前完成依赖；如果以后增加自定义异步 stream，需要让它们在结束 event 所在 stream 上汇合。
-
-最终报告新增的公共字段如下：
-
-| 字段 | 含义 |
-| --- | --- |
-| `inference_seconds` | 同步边界下的模型调用 wall time 总秒数 |
-| `inference_chunks` | 具有 wall time 的 chunk 数 |
-| `inference_ms_per_chunk` | wall time 总秒数 × 1000 / chunk 数 |
-| `inference_cuda_seconds` | CUDA Event 总秒数 |
-| `inference_cuda_chunks` | 具有有效 CUDA Event 计时的 chunk 数 |
-| `inference_cuda_ms_per_chunk` | CUDA Event 总秒数 × 1000 / 有效 CUDA chunk 数 |
-
-汇总按秒数和 chunk 数相加后求均值，避免不同任务长度导致“任务均值的平均”失真。旧结果缺少 CUDA 字段时不当作 0 秒，CPU/未测量的 chunk 也不进入 CUDA 均值的分母。
-
-LIBERO 的任务 JSON 保留逐 episode 时间和缓存统计，并把计时汇总到 `summary.json`、`summary.csv`、逐任务 CSV 和终端输出。RoboTwin 保留逐 chunk 的 `fastwam_inference_timing_<task_config>.jsonl`，新增 `infer_cuda_s`；单任务及 manager 的最终报告都汇总 CUDA 指标，clean/random 分别报告。求 JSONL 总时间应累加 `infer_s` 或 `infer_cuda_s`，不要累加 `cumulative_infer_s`。单任务评测启动时会清空本次 task_config 对应的计时日志，防止同目录重跑追加旧记录。
-
-所有实际推理调用都会计入，包括首个 chunk 和首次编译；实现不会额外生成 warmup action，也不会为了计时改变 residual 缓存。比较基线和 C³ache 时保持同一编译设置，并优先同时报告总时间、每 chunk 时间、chunk 数和成功率。若要观察稳定运行时的速度，先采用 `compile_action_infer=false`，或单独分析首调用/编译开销；不要把包含编译的均值标成纯 GPU kernel 延迟。
-
-要分析 compile 与缓存为什么没有等比例叠加，参见 [分阶段推理诊断](INFERENCE_DIAGNOSTICS_zh.md)。新增诊断默认关闭，支持 LIBERO/RoboTwin 逐 chunk、逐 action step 的 host/CUDA Event 观测、编译计数和离线对比报告。研究方向见 [WAM 缓存研究报告](../reports/wam_cache_research_20261006.md)。
+设置 `EVALUATION.timing_enabled=true` 后，LIBERO 的任务结果 JSON 含 `inference_seconds`、`inference_chunks` 及逐 episode 数组；开启缓存时另有 `episode_c3cache_stats`。RoboTwin 在该任务的 `eval_output_dir` 下写 `fastwam_inference_timing_<task_config>.jsonl`，每行记录一个 chunk 的时间、episode/chunk 编号、缓存配置和统计。求总时间应累加每行 `infer_s`，不要累加已经累计过的 `cumulative_infer_s`；重跑时使用新的输出目录，避免把追加记录算入旧结果。计时覆盖模型调用直至 action 返回 CPU，不含外围图像预处理、action 反归一化或指标写盘。
 
 如果 episode 有 C 个 chunk，缓存 M/N 个 step，τ>0 时刷新次数为 `ceil(C/τ)`；τ=0 时为 1。忽略提前失效时，完整 action DiT 调用次数为 `refresh_count*N + (C-refresh_count)*(N-M)`。这个计数用于验证调度，不能当成端到端加速比，因为编码、prefill、head 和 scheduler 仍有开销。
