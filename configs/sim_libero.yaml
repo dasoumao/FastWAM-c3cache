@@ -41,7 +41,6 @@ EVALUATION:
   c3cache_start_step: 0
   c3cache_end_step: 6
   c3cache_refresh_interval: 4
-  c3cache_residual_space: hidden
 
   # Optional external inputs
   dataset_stats_path: null

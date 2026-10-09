@@ -18,7 +18,6 @@ class C3Cache:
     reused_steps: int = 0
     last_chunk_full_steps: int = 0
     last_chunk_reused_steps: int = 0
-    residual_space: str = "hidden"
 
     def reset(self) -> None:
         self.signature = None
@@ -28,14 +27,11 @@ class C3Cache:
         self.reused_steps = 0
         self.last_chunk_full_steps = 0
         self.last_chunk_reused_steps = 0
-        self.residual_space = "hidden"
 
-    def begin(self, signature: tuple[Any, ...], residual_space: str = "hidden") -> int:
-        validate_c3cache_residual_space(residual_space)
-        if self.signature != signature or self.residual_space != residual_space:
+    def begin(self, signature: tuple[Any, ...]) -> int:
+        if self.signature != signature:
             self.reset()
             self.signature = signature
-        self.residual_space = residual_space
         return self.chunk_index
 
     def should_reuse(
@@ -67,16 +63,7 @@ class C3Cache:
             "last_chunk_full_steps": self.last_chunk_full_steps,
             "last_chunk_reused_steps": self.last_chunk_reused_steps,
             "cached_steps": tuple(sorted(self.residuals)),
-            "residual_space": self.residual_space,
         }
-
-
-def validate_c3cache_residual_space(residual_space: str) -> None:
-    if residual_space not in ("hidden", "velocity"):
-        raise ValueError(
-            "`c3cache_residual_space` must be 'hidden' or 'velocity'; "
-            f"got {residual_space!r}."
-        )
 
 
 def validate_c3cache_range(

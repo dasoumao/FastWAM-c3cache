@@ -26,6 +26,5 @@ c3cache_enabled: false
 c3cache_start_step: 0
 c3cache_end_step: 6
 c3cache_refresh_interval: 4
-c3cache_residual_space: hidden
 timing_enabled: false
 skip_get_obs_within_replan: false

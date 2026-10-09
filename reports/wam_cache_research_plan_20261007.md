@@ -1,5 +1,7 @@
 # WAM 缓存加速研究方案（2026-10-07）
 
+> 2026-10-09 更正：下文“velocity residual”是 hidden residual 的输出投影，未实现用户要求的跨去噪 step velocity 差值。该实现和配置已删除，本文保留作历史记录，其中旧配置不可再使用；当前定义、三条实验线及公平对照以 [新版 velocity 实验方案](velocity_cache_experiment_plan_20261009.md) 为准，原优先级不再直接沿用。
+
 本文记录基于当前 FastWAM 实现的研究建议。代数推导、文献已有结论和待验证假设分别注明；没有运行模型或据此宣称新方法有效。
 
 
@@ -7,10 +9,10 @@
 
 - `experiment/inference-timing` 保存至 `7a49ed6` 的计时版本，包含 CUDA 总计时、分阶段诊断、分析脚本及旧报告；其两个计时提交为 `1486b90`、`7a49ed6`。
 - `main` 通过撤销提交 `d3312fc` 移除这两次计时改动，不改写原历史。C3ache 原有可选 wall timing 保留；后加的 CUDA/Event 分阶段观测仅在计时分支。
-- 本文件作为新的研究方案保留在 main，汇总之前讨论并明确新增 velocity residual 的定义。
-- 本次实现输出空间 residual 缓存；前缀仿射合并、动态误差判别、视觉预测刷新仍属于后续研究，未宣称已经完成。
+- 本文件保留早期研究讨论；当前实验顺序与定义见 2026-10-09 新方案。
+- 当时实现的输出空间 residual 缓存现已删除；前缀仿射合并、动态误差判别、视觉预测刷新仍属于后续研究，未实现。
 
-### 0.1 已实现的 velocity residual 缓存
+### 0.1 历史实现：已于 2026-10-09 删除的输出投影缓存
 
 定义 E 为 action_encoder，H 为输出 head，F 为完整 action DiT 堆栈。第 k 步完整运行时：
 
@@ -34,14 +36,13 @@ x_next = scheduler.step(v_cached, delta_k, x_k_current)
 
 两种模式的缓存 shape 分别是 `[B,H,D_hidden]` 与 `[B,H,D_action]`。以 hidden_dim=1024、action_dim=7 为例，单缓存张量元素数减少约 146.3 倍；这是 residual 存储量，不是模型显存或速度改善倍数。velocity 复用仍需 encoder 和 head，刷新还多一次 head，因此实际时延不保证优于 hidden。
 
-配置：`EVALUATION.c3cache_enabled=true EVALUATION.c3cache_residual_space=velocity`。原模式为 `hidden`，默认仍为 hidden。缓存区间、tau、episode reset、video prefill 和全部 scheduler 步骤沿用原规则；切换 residual_space 会清空不兼容的缓存并从刷新 chunk 开始。两种模式共用一份缓存状态，不能混合历史条目。
+历史配置（已删除，不能再运行）：`EVALUATION.c3cache_enabled=true EVALUATION.c3cache_residual_space=velocity`。原模式为 `hidden`，默认仍为 hidden。缓存区间、tau、episode reset、video prefill 和全部 scheduler 步骤沿用原规则；切换 residual_space 会清空不兼容的缓存并从刷新 chunk 开始。两种模式共用一份缓存状态，不能混合历史条目。
 
-### 0.2 本阶段验收与后续顺序
+### 0.2 旧验收顺序已撤销
 
-1. 标准库假模型检查带 bias 的数学运算、当前 noisy action 依赖、hidden/velocity 多 chunk 等价、tau=0/1/4/8、非零区间起点及空间切换失效；不加载真实模型。
-2. GPU 机器固定 checkpoint、观察、proprio、prompt、seed 与 schedule，对比 baseline、hidden、velocity。先 tau=1 验证完整预测，再 tau=4 验证复用。分别检查 FP32 与实际 BF16 误差，不把实数等价当成逐 bit 一致。
-3. 使用相同 episode 初始状态比较成功率与 residual 缓存元素数；分阶段性能观测使用计时分支，若要测新机制需把本次机制提交合入计时实验分支，不能直接比较两个实现不一致的分支。
-4. 先建立 projected residual 的误差与储存基线，再决定是否继续前缀仿射合并（下文第 3 节）。如速度收益很小，应作为结构基线，不单独主张新的有效加速方法。
+此前以 projected residual 为主线的验收顺序不再执行，相关专属测试也随实现删除。后续按新版方案开展真实起点、执行简化、便宜条件起点三条实验线；不得把旧投影模式重新接回并标记为跨 step velocity 方法。
+
+计时分支保留历史诊断代码。未来对比时，应选择性迁移新算法改动，并核对两组算法版本一致；不要直接合并包含计时撤销提交的 main，以免撤掉诊断代码，也不要恢复旧投影实现。当前仍未进行真实模型验收。
 
 ## 1. 前提：residual 不是输入无关的常量
 

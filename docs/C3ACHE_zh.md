@@ -4,7 +4,7 @@
 
 ## 方法与代码的对应关系
 
-默认 `hidden` 模式缓存 **action expert 的整个 DiT 堆栈 residual**：`R = h_L - h_0`。每个去噪 step 有独立缓存，在同一 episode 的后续 action chunk 中复用。命中时使用当前 `h_0 + R`，继续执行输出 head 和 scheduler；只跳过 DiT blocks。图像编码和 video KV prefill 每个 chunk 仍然执行。[论文 §3](https://arxiv.org/html/2606.08962v1#S3)
+缓存对象是 **action expert 的整个 DiT 堆栈 residual**：`R = h_L - h_0`。每个去噪 step 有独立缓存，在同一 episode 的后续 action chunk 中复用。命中时使用当前 `h_0 + R`，继续执行输出 head 和 scheduler；只跳过 DiT blocks。图像编码和 video KV prefill 每个 chunk 仍然执行。[论文 §3](https://arxiv.org/html/2606.08962v1#S3)
 
 在本仓库中：
 
@@ -13,7 +13,7 @@
 - `ActionDiT.post()` 把隐藏特征投影为 action velocity。
 - `WanContinuousFlowMatchScheduler.step()` 更新 noisy action。
 
-因此默认模式的 residual 是隐藏特征张量，形状为 `[batch, action_horizon, hidden_dim]`，并非 action 空间里的 velocity 或相邻 sampler 状态之差。默认 action hidden dimension 为 1024。新增 `velocity` 模式在输出空间缓存同一堆栈的增量，定义见下文。
+因此 residual 是隐藏特征张量，形状为 `[batch, action_horizon, hidden_dim]`，并非 action 空间里的 velocity 或相邻 sampler 状态之差。默认 action hidden dimension 为 1024。
 
 **关于新观测：**当前代码的 `h_0` 只编码 noisy action，不直接编码图像或 proprio。图像通过 video KV 的 joint attention 进入 action blocks，文本/proprio 通过 context attention 进入。因此命中的 step 不会重新读取这些条件；保留的完整计算步骤会读取当前条件。实现没有额外添加“把新观测加进 h_0”的运算。
 
@@ -33,7 +33,6 @@
 | `EVALUATION` 参数 | 默认值 | 含义 |
 | --- | --- | --- |
 | `c3cache_enabled` | `false` | 开关；关闭即原始推理路径 |
-| `c3cache_residual_space` | `hidden` | `hidden` 或 `velocity`，切换会清空旧缓存 |
 | `c3cache_start_step` | `0` | 缓存区间起点，含端点 |
 | `c3cache_end_step` | `6` | 缓存区间终点，含端点 |
 | `c3cache_refresh_interval` | `4` | τ，按生成的 chunk 数计数 |
@@ -69,41 +68,6 @@ for observation in episode_observations:
     # 使用 result["action"] 执行或更新动作队列。
 print(model.get_c3cache_stats())
 ```
-
-## Velocity residual 模式
-
-令 `H = action_expert.post`。刷新时计算：
-
-```python
-v_full = H(h_L)
-R_v = v_full - H(h_0)
-```
-
-刷新步直接使用 `v_full`；后续 chunk 命中对应 step 时使用：
-
-```python
-v_cached = H(action_encoder(current_noisy_action)) + R_v
-```
-
-`R_v` 的 shape 为 `[batch, action_horizon, action_dim]`。它不是完整 velocity，也不是相邻去噪步的 velocity 差值。每个 step 各存一份，与原 hidden residual 的范围和 tau 调度相同；所有 scheduler 步骤和每 chunk 的 video prefill 仍然执行。
-
-当前 head 为 `H(h)=W_h h+b_h`，故 `R_v=W_h(h_L-h_0)`。不能用 `H(h_L-h_0)` 替代，因为后者多了 bias。当前线性结构下，hidden/velocity 两种缓存复用在实数运算下等价，但 BF16/FP16 的舍入不同，不保证逐 bit 一致。velocity 模式降低 residual 存储维度，不能据此宣称同倍数的显存或时延收益。
-
-在已有 LIBERO 或 RoboTwin 命令后设置：
-
-```bash
-EVALUATION.c3cache_enabled=true \
-EVALUATION.c3cache_residual_space=velocity \
-EVALUATION.c3cache_start_step=0 \
-EVALUATION.c3cache_end_step=6 \
-EVALUATION.c3cache_refresh_interval=4
-```
-
-三组对照仅改变缓存开关/空间：baseline 为 `c3cache_enabled=false`；原 C3ache 为 `c3cache_enabled=true c3cache_residual_space=hidden`；输出空间缓存为 `c3cache_enabled=true c3cache_residual_space=velocity`。其余 checkpoint、编译设置、种子、去噪步数和 replan_steps 保持一致。
-
-直接调用模型时传 `c3cache_residual_space="velocity"`。`get_c3cache_stats()` 和评测结果中的缓存配置增加 `residual_space` 字段。切换模式会从 chunk 0 重新刷新，避免将 hidden_dim 与 action_dim 的缓存混用。
-
-新的研究方案见 [WAM 缓存研究方案（2026-10-07）](../reports/wam_cache_research_plan_20261007.md)。CUDA 总计时、分阶段诊断及其报告保存在 `experiment/inference-timing` 分支；main 只保留原先可选的简单 wall timing，不含后加的诊断插桩。
 
 同一个 model 实例对应一条顺序 episode 流。不要把多个环境的 chunk 交错喂给同一个缓存。外部直接修改模型权重或更换语义上下文时，也应 reset。
 
@@ -174,3 +138,12 @@ LIBERO 默认开启 `torch.compile`，本说明的起始验收命令先用 eager
 设置 `EVALUATION.timing_enabled=true` 后，LIBERO 的任务结果 JSON 含 `inference_seconds`、`inference_chunks` 及逐 episode 数组；开启缓存时另有 `episode_c3cache_stats`。RoboTwin 在该任务的 `eval_output_dir` 下写 `fastwam_inference_timing_<task_config>.jsonl`，每行记录一个 chunk 的时间、episode/chunk 编号、缓存配置和统计。求总时间应累加每行 `infer_s`，不要累加已经累计过的 `cumulative_infer_s`；重跑时使用新的输出目录，避免把追加记录算入旧结果。计时覆盖模型调用直至 action 返回 CPU，不含外围图像预处理、action 反归一化或指标写盘。
 
 如果 episode 有 C 个 chunk，缓存 M/N 个 step，τ>0 时刷新次数为 `ceil(C/τ)`；τ=0 时为 1。忽略提前失效时，完整 action DiT 调用次数为 `refresh_count*N + (C-refresh_count)*(N-M)`。这个计数用于验证调度，不能当成端到端加速比，因为编码、prefill、head 和 scheduler 仍有开销。
+
+
+## 研究方案与已移除功能
+
+2026-10-09 已删除旧输出投影 velocity 模式，包括模型分支、评测参数传递、缓存空间字段及专属测试。当前只保留原始 hidden residual 缓存；旧命令中的 `EVALUATION.c3cache_residual_space` 参数应删去，无需再指定 `hidden`。
+
+真实起点的跨 step velocity 差值、直接 velocity 缓存、前缀终点及虚拟/便宜条件起点仍是待实现方案，见 [新版实验计划](../reports/velocity_cache_experiment_plan_20261009.md)。旧投影版本的结果不能归入这些新方案。
+
+新增 CUDA 总计时和分阶段诊断仍保存在 `experiment/inference-timing` 分支，main 保留原有可选 wall timing。
