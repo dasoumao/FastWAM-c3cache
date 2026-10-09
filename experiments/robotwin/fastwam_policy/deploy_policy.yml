@@ -23,6 +23,8 @@ negative_prompt: ""
 rand_device: cpu
 tiled: false
 c3cache_enabled: false
+c3cache_method: hidden
+c3cache_probe_depth: 1
 c3cache_start_step: 0
 c3cache_end_step: 6
 c3cache_refresh_interval: 4

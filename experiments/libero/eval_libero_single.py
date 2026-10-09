@@ -307,6 +307,8 @@ def _c3cache_infer_kwargs(model: torch.nn.Module, cfg: DictConfig) -> dict[str, 
 
     cache_keys = (
         "c3cache_enabled",
+        "c3cache_method",
+        "c3cache_probe_depth",
         "c3cache_start_step",
         "c3cache_end_step",
         "c3cache_refresh_interval",
@@ -330,6 +332,8 @@ def _c3cache_infer_kwargs(model: torch.nn.Module, cfg: DictConfig) -> dict[str, 
         )
     return {
         "c3cache_enabled": True,
+        "c3cache_method": str(cfg.EVALUATION.get("c3cache_method", "hidden")),
+        "c3cache_probe_depth": int(cfg.EVALUATION.get("c3cache_probe_depth", 1)),
         "c3cache_start_step": int(cfg.EVALUATION.get("c3cache_start_step", 0)),
         "c3cache_end_step": int(cfg.EVALUATION.get("c3cache_end_step", 6)),
         "c3cache_refresh_interval": int(cfg.EVALUATION.get("c3cache_refresh_interval", 4)),
@@ -679,6 +683,8 @@ def run_single_task(
         "task_description": task_description,
         "c3cache": {
             "enabled": bool(cfg.EVALUATION.get("c3cache_enabled", False)),
+            "method": str(cfg.EVALUATION.get("c3cache_method", "hidden")),
+            "probe_depth": int(cfg.EVALUATION.get("c3cache_probe_depth", 1)),
             "start_step": int(cfg.EVALUATION.get("c3cache_start_step", 0)),
             "end_step": int(cfg.EVALUATION.get("c3cache_end_step", 6)),
             "refresh_interval": int(cfg.EVALUATION.get("c3cache_refresh_interval", 4)),

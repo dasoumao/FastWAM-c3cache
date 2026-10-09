@@ -4,7 +4,7 @@
 
 ## 方法与代码的对应关系
 
-缓存对象是 **action expert 的整个 DiT 堆栈 residual**：`R = h_L - h_0`。每个去噪 step 有独立缓存，在同一 episode 的后续 action chunk 中复用。命中时使用当前 `h_0 + R`，继续执行输出 head 和 scheduler；只跳过 DiT blocks。图像编码和 video KV prefill 每个 chunk 仍然执行。[论文 §3](https://arxiv.org/html/2606.08962v1#S3)
+默认 `hidden` 方法缓存 **action expert 的整个 DiT 堆栈 residual**：`R = h_L - h_0`。每个去噪 step 有独立缓存，在同一 episode 的后续 action chunk 中复用。命中时使用当前 `h_0 + R`，继续执行输出 head 和 scheduler；只跳过 DiT blocks。图像编码和 video KV prefill 每个 chunk 仍然执行。新增 velocity 实验方法见后文。[论文 §3](https://arxiv.org/html/2606.08962v1#S3)
 
 在本仓库中：
 
@@ -33,6 +33,8 @@
 | `EVALUATION` 参数 | 默认值 | 含义 |
 | --- | --- | --- |
 | `c3cache_enabled` | `false` | 开关；关闭即原始推理路径 |
+| `c3cache_method` | `hidden` | 缓存方法，见下文 velocity 实验 |
+| `c3cache_probe_depth` | `1` | `velocity_probe` 条件起点运行的 action block 数 |
 | `c3cache_start_step` | `0` | 缓存区间起点，含端点 |
 | `c3cache_end_step` | `6` | 缓存区间终点，含端点 |
 | `c3cache_refresh_interval` | `4` | τ，按生成的 chunk 数计数 |
@@ -140,10 +142,100 @@ LIBERO 默认开启 `torch.compile`，本说明的起始验收命令先用 eager
 如果 episode 有 C 个 chunk，缓存 M/N 个 step，τ>0 时刷新次数为 `ceil(C/τ)`；τ=0 时为 1。忽略提前失效时，完整 action DiT 调用次数为 `refresh_count*N + (C-refresh_count)*(N-M)`。这个计数用于验证调度，不能当成端到端加速比，因为编码、prefill、head 和 scheduler 仍有开销。
 
 
-## 研究方案与已移除功能
+## Velocity 实验实现
 
-2026-10-09 已删除旧输出投影 velocity 模式，包括模型分支、评测参数传递、缓存空间字段及专属测试。当前只保留原始 hidden residual 缓存；旧命令中的 `EVALUATION.c3cache_residual_space` 参数应删去，无需再指定 `hidden`。
+2026-10-09 已删除旧输出投影模式 `H(h_L)-H(h_0)` 及 `c3cache_residual_space` 接口。下面的新方法使用独立的 `c3cache_method` 参数，旧投影版本的结果不能归入这些新方案。数学定义和公平对照见 [实验计划](../reports/velocity_cache_experiment_plan_20261009.md)。
 
-真实起点的跨 step velocity 差值、直接 velocity 缓存、前缀终点及虚拟/便宜条件起点仍是待实现方案，见 [新版实验计划](../reports/velocity_cache_experiment_plan_20261009.md)。旧投影版本的结果不能归入这些新方案。
+令 r 为完整刷新 chunk，c 为当前 chunk，k 为去噪循环序号。各模式都按同一 τ 调度，完整刷新时执行全部 N 次真实去噪。命中 chunk 的区别如下：
+
+| `c3cache_method` | 命中时使用的预测/状态 | 区间要求 |
+| --- | --- | --- |
+| `hidden` | 原 `H(E(x_k)+R_k^r)` | 任意合法连续区间 |
+| `velocity_delta` | 真实计算当前 `v_0^c`，之后 `v_0^c+(v_k^r-v_0^r)` | 起点必须为 1 |
+| `velocity` | 直接使用 `v_k^r` | 起点必须为 0 |
+| `prefix` | 直接从刷新时的 `x_{B+1}^r` 开始真实尾部 | 起点必须为 0 |
+| `velocity_virtual` | `b^c+(v_k^r-b^r)`，`b=H(E(x_0))` | 起点必须为 0 |
+| `velocity_probe` | `g^c+(v_k^r-g^r)` | 起点必须为 0 |
+
+`velocity_delta` 缓存相对真实首步的累计差值，与同一刷新轨迹的相邻差分 `v_k-v_{k-1}` 连加在实数下等价。它没有第 −1 步，也不缓存旧版的 head 投影 residual。
+
+条件起点 `g` 使用当前 step 0 的 noisy action、timestep、video K/V 与文本/proprio context，运行前 `c3cache_probe_depth` 个 action blocks，再接原 head。这是无需训练的浅层代理实验；原 head 未针对浅层特征训练，不能预设它准确。代理在刷新和复用 chunk 都有计算成本，其 block 数单独统计，不能只看完整 forward 次数判断预算。
+
+`velocity` 和 `prefix` 只在可保证相同初始噪声时复用：固定非空 seed，并保持随机设备、形状、dtype 等设置一致。`seed=None` 或换用自定义 scheduler 时回退完整刷新，不把 fresh noise 当成等价前缀。`velocity_virtual` 在固定初始噪声下退化为直接 velocity 复用，仅作为等价对照；新噪声下其起点变化不代表当前观察校正。
+
+`prefix` 是唯一跳过缓存前缀 scheduler 更新的模式；其他模式仍执行全部 scheduler 步。所有模式每个 chunk 仍计算当前观察编码与 video prefill，供真实尾部或浅层条件起点读取。缓存拥有独立存储，完整推理成功后才提交新轨迹。实数等价不保证 BF16 位级一致，真实张量精度与闭环效果需在服务器验证。
+
+正常调用 FastWAM 的加载权重、设备转换或训练入口会清空缓存；若绕过这些入口直接修改子模块权重，需要显式 `model.reset_c3cache()`。运行时不会为了检测这种外部修改而逐 chunk 遍历全部模型参数。
+
+任务 JSON 的 `episode_c3cache_stats` 新增 `refresh_chunks`、`reuse_chunks`、`fallback_chunks`、`scheduler_skipped_steps`、`probe_steps` 和 `probe_blocks`。`cached_from_chunk` 是当前整套缓存的来源 chunk 编号；`last_chunk_reason` 区分首次/定期刷新、命中、缺失缓存、非固定噪声和不支持的 scheduler。代理 block 次数不包含在 `full_steps` 中，比较预算时需另外计入。
+
+例如 N=10、B=6、τ=4，在前面的评测命令后设置：
+
+```bash
+# A1：首步真实，复用 [1,6]，命中 chunk 共 4 次完整 DiT
+EVALUATION.c3cache_enabled=true EVALUATION.c3cache_method=velocity_delta \
+EVALUATION.c3cache_start_step=1 EVALUATION.c3cache_end_step=6 \
+EVALUATION.c3cache_refresh_interval=4
+
+# A2：首步真实，复用 [1,7]，命中 chunk 共 3 次完整 DiT
+EVALUATION.c3cache_enabled=true EVALUATION.c3cache_method=velocity_delta \
+EVALUATION.c3cache_start_step=1 EVALUATION.c3cache_end_step=7 \
+EVALUATION.c3cache_refresh_interval=4
+```
+
+A1/A2 的同位置对照只需把 `c3cache_method` 改为 `hidden`。与原 hidden `[0,6]` 比较时，A1 多一次完整调用；A2 调用数相同但真实计算位置不同。
 
 新增 CUDA 总计时和分阶段诊断仍保存在 `experiment/inference-timing` 分支，main 保留原有可选 wall timing。
+
+## 批量 LIBERO 实验
+
+`scripts/run_libero_cache_experiments.py` 使用标准库构造命令，逐组调用原 `experiments/libero/run_libero_manager.py`。默认权重、dataset stats、task 和 `sigma_shift=5.0` 与 README 的 release LIBERO 命令一致；显式固定 N=10、replan_steps=10、seed=42，默认扫描 B=3,5,6,7 和 τ=4，probe 深度 1、2。
+
+```bash
+# 预览全部命令，无需模型、Hydra 或 GPU
+python scripts/run_libero_cache_experiments.py --num-gpus 1 --num-trials 10 --dry-run
+
+# 全部三条实验线（在 GPU 服务器执行）
+python scripts/run_libero_cache_experiments.py --num-gpus 1 --num-trials 10
+
+# 只跑真实首步的质量对照，固定 B=6
+python scripts/run_libero_cache_experiments.py --lines quality --ends 6 \
+  --num-gpus 1 --num-trials 10 --output-root evaluate_results/cache_quality_b6
+
+# 相同算法分别开/关 compile，并重复三个 seed
+python scripts/run_libero_cache_experiments.py --ends 6 --compile both \
+  --seeds 42,43,44 --num-gpus 1 --num-trials 10 \
+  --output-root evaluate_results/cache_compile_b6
+```
+
+| 选项 | 用途 |
+| --- | --- |
+| `--lines all` | 三条实验线及对照，默认 |
+| `--lines quality` | H0/H1/H2、A1/A2 与 baseline |
+| `--lines simplify` | H0、直接 velocity、prefix 与 baseline |
+| `--lines anchors` | H0、虚拟/浅层条件起点、A1/A2 与 baseline |
+| `--ends 3,5,6,7` | 原 hidden 的前缀终点 B；A2/H2 自动使用 B+1 |
+| `--taus 4` | 刷新间隔列表，例如 `0,1,4,8` |
+| `--probe-depths 1,2` | 浅层条件起点深度列表 |
+| `--compile false` | 默认 eager；可选 `true`、`both` |
+| `--seed 42` / `--seeds 42,43` | 配对实验种子列表 |
+| `--num-trials 50` | 每任务 episode 数，默认 50 |
+| `--num-gpus 8` | manager 内部 worker 数，默认 8；各实验组顺序执行 |
+| `--task-file PATH` | 用已有 `suite,task_id` 文件缩小任务集 |
+| `--ckpt PATH`、`--dataset-stats PATH` | 覆盖 release 权重和归一化统计路径 |
+| `--output-root PATH` | 独立实验目录；更换配置请使用新目录 |
+| `--continue-on-error` | 某组失败后继续其他组，最终仍以非零状态退出 |
+
+每个 seed/compile 设置只跑一次 baseline。B=6 的全部实验包含 11 组，每组默认四个 suite、40 个任务；每任务 10 次就是 4,400 个 episode。完整扫描会复用实际配置相同的对照，dry run 会给出实际组数和 episode 估算。
+
+批量目录中 `manifest.json` 留存配置、精确 argv、运行状态与结果目录，`summary.csv` 汇总成功率、wall ms/chunk 和缓存计数；每组目录下有 `manager.log`、原 manager 配置和逐任务 JSON。失败重试写新 attempt，不覆盖旧结果。脚本核对任务清单、结果数量和 episode 数，不把缺少任务的运行标记为完成。
+
+汇总的 wall ms/chunk 包含首次推理/编译成本，不能直接称为稳态速度，也不是 CUDA kernel 时间。此脚本未将计时分支的诊断插桩搬回 main；正式性能实验仍需一致预热与 GPU 验收。
+
+本地检查：
+
+```bash
+python scripts/check_c3cache.py
+python scripts/check_libero_cache_experiments.py
+python scripts/check_velocity_cache.py
+```

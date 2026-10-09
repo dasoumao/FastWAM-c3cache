@@ -336,6 +336,20 @@ python experiments/libero/run_libero_manager.py \
   MULTIRUN.num_gpus=8
 ```
 
+Run the complete LIBERO cache experiment matrix using the same manager and release checkpoint:
+
+```bash
+# Standard-library preview: no model or evaluation dependencies loaded
+python scripts/run_libero_cache_experiments.py --num-gpus 1 --num-trials 10 --dry-run
+
+# Run on an already configured GPU server
+python scripts/run_libero_cache_experiments.py --num-gpus 1 --num-trials 10
+```
+
+The matrix includes baseline, matched hidden-cache controls, true-first-step velocity differences, direct velocity, prefix endpoints, virtual anchors, and shallow conditional anchors. Defaults: prefix ends `3,5,6,7`, refresh interval `4`, probe depths `1,2`, eager inference, and all four LIBERO suites. Use `--ends 6` for a smaller matrix, `--compile both` for eager/compiled comparisons, or `--seeds 42,43,44` for repeats. Each task defaults to 50 trials unless overridden as above.
+
+Commands, per-case logs, and summary CSV are saved under `evaluate_results/libero_cache_experiments/`. Repeating identical settings verifies and skips completed cases; use a new `--output-root` for different settings. See the [experiment guide](docs/C3ACHE_zh.md#批量-libero-实验) for method definitions and comparison budgets. These experimental methods still require real-model numerical and closed-loop validation.
+
 Optional: evaluate released RoboTwin checkpoint:
 
 ```bash

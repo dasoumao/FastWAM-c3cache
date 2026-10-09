@@ -139,6 +139,8 @@ def _resize_rgb(image: np.ndarray, size_wh: tuple[int, int]) -> np.ndarray:
 def _validate_c3cache_support(model: torch.nn.Module) -> None:
     cache_keys = (
         "c3cache_enabled",
+        "c3cache_method",
+        "c3cache_probe_depth",
         "c3cache_start_step",
         "c3cache_end_step",
         "c3cache_refresh_interval",
@@ -184,6 +186,8 @@ class WorldActionRobotWinPolicy:
         num_video_frames: int,
         *,
         c3cache_enabled: bool = False,
+        c3cache_method: str = "hidden",
+        c3cache_probe_depth: int = 1,
         c3cache_start_step: int = 0,
         c3cache_end_step: int = 6,
         c3cache_refresh_interval: int = 4,
@@ -215,6 +219,8 @@ class WorldActionRobotWinPolicy:
         self.rand_device = str(rand_device)
         self.tiled = bool(tiled)
         self.c3cache_enabled = bool(c3cache_enabled)
+        self.c3cache_method = str(c3cache_method)
+        self.c3cache_probe_depth = int(c3cache_probe_depth)
         self.c3cache_start_step = int(c3cache_start_step)
         self.c3cache_end_step = int(c3cache_end_step)
         self.c3cache_refresh_interval = int(c3cache_refresh_interval)
@@ -309,6 +315,8 @@ class WorldActionRobotWinPolicy:
         if self.c3cache_enabled:
             infer_kwargs.update(
                 c3cache_enabled=True,
+                c3cache_method=self.c3cache_method,
+                c3cache_probe_depth=self.c3cache_probe_depth,
                 c3cache_start_step=self.c3cache_start_step,
                 c3cache_end_step=self.c3cache_end_step,
                 c3cache_refresh_interval=self.c3cache_refresh_interval,
@@ -329,6 +337,8 @@ class WorldActionRobotWinPolicy:
                 "cumulative_infer_s": self._timing_rollout["infer_s"],
                 "c3cache": {
                     "enabled": self.c3cache_enabled,
+                    "method": self.c3cache_method,
+                    "probe_depth": self.c3cache_probe_depth,
                     "start_step": self.c3cache_start_step,
                     "end_step": self.c3cache_end_step,
                     "refresh_interval": self.c3cache_refresh_interval,
@@ -457,6 +467,10 @@ def get_model(usr_args: Dict[str, Any]):
     c3cache_enabled = _parse_bool(
         usr_args.get("c3cache_enabled", cfg.EVALUATION.get("c3cache_enabled", False))
     )
+    c3cache_method = str(usr_args.get("c3cache_method", cfg.EVALUATION.get("c3cache_method", "hidden")))
+    c3cache_probe_depth = int(
+        usr_args.get("c3cache_probe_depth", cfg.EVALUATION.get("c3cache_probe_depth", 1))
+    )
     c3cache_start_step = int(
         usr_args.get("c3cache_start_step", cfg.EVALUATION.get("c3cache_start_step", 0))
     )
@@ -487,6 +501,8 @@ def get_model(usr_args: Dict[str, Any]):
         rand_device=rand_device,
         tiled=tiled,
         c3cache_enabled=c3cache_enabled,
+        c3cache_method=c3cache_method,
+        c3cache_probe_depth=c3cache_probe_depth,
         c3cache_start_step=c3cache_start_step,
         c3cache_end_step=c3cache_end_step,
         c3cache_refresh_interval=c3cache_refresh_interval,

@@ -320,6 +320,20 @@ python experiments/libero/run_libero_manager.py \
   MULTIRUN.num_gpus=8
 ```
 
+一次运行 LIBERO 缓存研究的全部对照（复用上述 manager 和 release 权重）：
+
+```bash
+# 只打印实验矩阵和命令，不加载模型，也不需要安装评测依赖
+python scripts/run_libero_cache_experiments.py --num-gpus 1 --num-trials 10 --dry-run
+
+# 在已配置的 GPU 服务器上顺序执行全部实验
+python scripts/run_libero_cache_experiments.py --num-gpus 1 --num-trials 10
+```
+
+默认比较 baseline、三种 hidden 区间对照、真实首步 velocity 差值的两种区间、直接 velocity、前缀终点、虚拟起点和浅层条件起点；扫描 `B=3,5,6,7`、`τ=4`，条件起点深度为 `1,2`。默认关闭 action compile，优先验证质量；`--compile both` 可同时运行 eager/compile 对照。每组覆盖四个 LIBERO suite。可用 `--ends 6` 缩小范围，`--seeds 42,43,44` 重复种子实验，`--taus 0,1,4,8` 扩展刷新间隔。
+
+结果写入 `evaluate_results/libero_cache_experiments/`，包含实验清单、逐组日志和汇总 CSV。重复执行相同设置会检查并跳过完整结果；修改设置时使用新的 `--output-root`。未指定 `--num-trials` 时沿用 README 评测配置的每任务 50 次。方法定义、预算差异和完整用法见 [缓存实验说明](docs/C3ACHE_zh.md#批量-libero-实验)。这些新方法尚未完成真实 GPU 数值与成功率验收。
+
 一键评测 release 的 RoboTwin 权重：
 
 ```bash

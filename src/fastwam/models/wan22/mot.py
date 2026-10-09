@@ -535,10 +535,14 @@ class MoT(nn.Module):
         video_cache_k: list[torch.Tensor],
         video_cache_v: list[torch.Tensor],
         action_attention_mask: torch.Tensor,
+        depth_limit: int | None = None,
     ) -> torch.Tensor:
+        """Run the full action stack, or its first ``depth_limit`` blocks for a probe."""
         expert = self.mixtures["action"]
         x = action_tokens
-        for layer_idx in range(self.num_layers):
+        if depth_limit is not None and not 1 <= depth_limit <= self.num_layers:
+            raise ValueError(f"`depth_limit` must be in [1, {self.num_layers}].")
+        for layer_idx in range(self.num_layers if depth_limit is None else depth_limit):
             block = expert.blocks[layer_idx]
             (
                 q_action,

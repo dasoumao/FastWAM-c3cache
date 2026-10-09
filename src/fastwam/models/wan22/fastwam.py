@@ -9,7 +9,7 @@ from PIL import Image
 from fastwam.utils.logging_config import get_logger
 
 from .action_dit import ActionDiT
-from .c3cache import C3Cache, validate_c3cache_range
+from .c3cache import C3Cache, validate_c3cache_method, validate_c3cache_range
 from .helpers.loader import load_wan22_ti2v_5b_components
 from .mot import MoT
 from .schedulers.scheduler_continuous import WanContinuousFlowMatchScheduler
@@ -90,6 +90,7 @@ class FastWAM(torch.nn.Module):
         self.compile_training_denoise = bool(compile_training_denoise)
         self.mot.compile_training_layers = self.compile_training_denoise
         self._c3cache = C3Cache()
+        self._c3cache_model_revision = 0
 
         self.to(self.device)
 
@@ -208,7 +209,8 @@ class FastWAM(torch.nn.Module):
         return super().load_state_dict(*args, **kwargs)
 
     def reset_c3cache(self) -> None:
-        """Start a new action episode and discard all cached residuals."""
+        """Start a new action episode; call after direct nested-module weight edits."""
+        self._c3cache_model_revision += 1
         self._c3cache.reset()
 
     def get_c3cache_stats(self) -> dict[str, Any]:
@@ -811,6 +813,44 @@ class FastWAM(torch.nn.Module):
         # The current noisy action, not the image, supplies the input tokens.
         return self.action_expert.post(self.action_expert.action_encoder(latents_action) + residual)
 
+    def _denoise_action_c3cache_virtual(self, latents_action: torch.Tensor) -> torch.Tensor:
+        """Unconditioned reference velocity H(E(x)); no DiT blocks are run."""
+        return self.action_expert.post(self.action_expert.action_encoder(latents_action))
+
+    def _denoise_action_c3cache_probe(
+        self,
+        latents_action: torch.Tensor,
+        timestep_action: torch.Tensor,
+        context: torch.Tensor,
+        context_mask: torch.Tensor,
+        video_cache_k: list[torch.Tensor],
+        video_cache_v: list[torch.Tensor],
+        action_attention_mask: torch.Tensor,
+        depth_limit: int,
+    ) -> torch.Tensor:
+        """Conditioned proxy from the first action blocks and existing output head."""
+        (
+            action_tokens, _t, action_t_mod, action_context,
+            action_context_mask, action_freqs,
+        ) = self.action_expert.prepare(
+            action_tokens=latents_action,
+            timestep=timestep_action,
+            context=context,
+            context_mask=context_mask,
+        )
+        partial_tokens = self.mot.forward_action_with_video_cache_tensor(
+            action_tokens=action_tokens,
+            action_freqs=action_freqs,
+            action_t_mod=action_t_mod,
+            action_context=action_context,
+            action_context_mask=action_context_mask,
+            video_cache_k=video_cache_k,
+            video_cache_v=video_cache_v,
+            action_attention_mask=action_attention_mask,
+            depth_limit=depth_limit,
+        )
+        return self.action_expert.post(partial_tokens)
+
     @torch.no_grad()
     def _predict_action_noise_with_cache(
         self,
@@ -1072,6 +1112,8 @@ class FastWAM(torch.nn.Module):
         c3cache_start_step: int = 0,
         c3cache_end_step: int = 6,
         c3cache_refresh_interval: int = 4,
+        c3cache_method: str = "hidden",
+        c3cache_probe_depth: int = 1,
     ) -> dict[str, Any]:
         if c3cache_enabled:
             if type(self) is not FastWAM:
@@ -1081,6 +1123,9 @@ class FastWAM(torch.nn.Module):
                 c3cache_start_step,
                 c3cache_end_step,
                 c3cache_refresh_interval,
+            )
+            validate_c3cache_method(
+                c3cache_method, c3cache_start_step, c3cache_probe_depth, self.mot.num_layers,
             )
         elif self._c3cache.signature is not None:
             # A disabled call ends the episode. Re-enabling starts at chunk zero.
@@ -1171,9 +1216,26 @@ class FastWAM(torch.nn.Module):
 
         if c3cache_enabled:
             c3cache_signature = (
+                c3cache_method,
+                c3cache_probe_depth,
                 num_inference_steps,
                 float(self.infer_action_scheduler.shift if sigma_shift is None else sigma_shift),
                 int(self.infer_action_scheduler.num_train_timesteps),
+                id(self.infer_action_scheduler),
+                id(type(self.infer_action_scheduler).build_inference_schedule),
+                id(type(self.infer_action_scheduler).step),
+                id(vars(self.infer_action_scheduler).get("build_inference_schedule")),
+                id(vars(self.infer_action_scheduler).get("step")),
+                # Explicit seeds create a new generator for every chunk. For the
+                # direct replay methods this identifies the initial noise without
+                # a device-to-host tensor fingerprint on every inference.
+                (seed, str(rand_device)) if c3cache_method in {"velocity", "prefix"} else None,
+                self._c3cache_model_revision,
+                id(self.video_expert),
+                id(self.action_expert),
+                id(self.mot),
+                id(self.vae),
+                id(self.proprio_encoder),
                 action_horizon,
                 tuple(input_image.shape),
                 tuple(latents_action.shape),
@@ -1259,11 +1321,23 @@ class FastWAM(torch.nn.Module):
                         mode="reduce-overhead",
                         fullgraph=True,
                     )
+                if c3cache_method == "velocity_virtual" and not hasattr(self, "_denoise_action_c3cache_virtual_compiled"):
+                    self._denoise_action_c3cache_virtual_compiled = torch.compile(
+                        self._denoise_action_c3cache_virtual, mode="reduce-overhead", fullgraph=True,
+                    )
+                if c3cache_method == "velocity_probe" and not hasattr(self, "_denoise_action_c3cache_probe_compiled"):
+                    self._denoise_action_c3cache_probe_compiled = torch.compile(
+                        self._denoise_action_c3cache_probe, mode="reduce-overhead", fullgraph=True,
+                    )
                 c3cache_refresh = self._denoise_action_c3cache_refresh_compiled
                 c3cache_reuse = self._denoise_action_c3cache_reuse_compiled
+                c3cache_virtual = getattr(self, "_denoise_action_c3cache_virtual_compiled", None)
+                c3cache_probe = getattr(self, "_denoise_action_c3cache_probe_compiled", None)
             else:
                 c3cache_refresh = self._denoise_action_c3cache_refresh
                 c3cache_reuse = self._denoise_action_c3cache_reuse
+                c3cache_virtual = self._denoise_action_c3cache_virtual
+                c3cache_probe = self._denoise_action_c3cache_probe
         if compile_action_infer:
             torch.compiler.cudagraph_mark_step_begin()
         video_cache_k, video_cache_v = prefill_video_cache(
@@ -1287,28 +1361,79 @@ class FastWAM(torch.nn.Module):
         )
         if c3cache_enabled:
             self._c3cache.begin(c3cache_signature)
+            reuse_reason = self._c3cache.reuse_reason(
+                c3cache_method, c3cache_start_step, c3cache_end_step,
+                c3cache_refresh_interval, seed is not None,
+                type(self.infer_action_scheduler) is WanContinuousFlowMatchScheduler
+                and "step" not in vars(self.infer_action_scheduler)
+                and "build_inference_schedule" not in vars(self.infer_action_scheduler),
+            )
+        else:
+            reuse_reason = ""
         staged_residuals: dict[int, torch.Tensor] = {}
-        full_steps = reused_steps = 0
+        staged_anchor = staged_endpoint = None
+        current_anchor = None
+        full_steps = reused_steps = scheduler_skipped_steps = probe_steps = probe_blocks = 0
         try:
+            if c3cache_enabled and c3cache_method in {"velocity_virtual", "velocity_probe"}:
+                if compile_action_infer:
+                    torch.compiler.cudagraph_mark_step_begin()
+                if c3cache_method == "velocity_virtual":
+                    current_anchor = c3cache_virtual(latents_action)
+                else:
+                    timestep_zero = infer_timesteps_action[0].unsqueeze(0).to(
+                        dtype=latents_action.dtype, device=self.device,
+                    )
+                    current_anchor = c3cache_probe(
+                        latents_action=latents_action,
+                        timestep_action=timestep_zero,
+                        context=context,
+                        context_mask=context_mask,
+                        video_cache_k=video_cache_k,
+                        video_cache_v=video_cache_v,
+                        action_attention_mask=action_attention_mask,
+                        depth_limit=c3cache_probe_depth,
+                    )
+                    probe_steps = 1
+                    probe_blocks = c3cache_probe_depth
+                # A compiled probe/virtual result may be graph-owned and may
+                # otherwise be overwritten by the next compiled denoise call.
+                current_anchor = current_anchor.detach().clone()
+                if reuse_reason != "reuse":
+                    staged_anchor = current_anchor.detach().clone()
+            if c3cache_enabled and c3cache_method == "prefix" and reuse_reason == "reuse":
+                latents_action = self._c3cache.endpoint.detach().clone()
+                reused_steps = scheduler_skipped_steps = c3cache_end_step + 1
+                first_denoise_step = c3cache_end_step + 1
+            else:
+                first_denoise_step = 0
             for step_index, (step_t_action, step_delta_action) in enumerate(
-                zip(infer_timesteps_action, infer_deltas_action)
+                zip(
+                    infer_timesteps_action[first_denoise_step:],
+                    infer_deltas_action[first_denoise_step:],
+                ),
+                start=first_denoise_step,
             ):
                 if compile_action_infer:
                     torch.compiler.cudagraph_mark_step_begin()
                 timestep_action = step_t_action.unsqueeze(0).to(dtype=latents_action.dtype, device=self.device)
 
-                if c3cache_enabled and self._c3cache.should_reuse(
-                    step_index,
-                    c3cache_start_step,
-                    c3cache_end_step,
-                    c3cache_refresh_interval,
-                ):
-                    pred_action = c3cache_reuse(
-                        latents_action=latents_action,
-                        residual=self._c3cache.residuals[step_index],
-                    )
+                cached_step = (
+                    c3cache_enabled and reuse_reason == "reuse"
+                    and c3cache_start_step <= step_index <= c3cache_end_step
+                )
+                if cached_step and c3cache_method == "hidden":
+                    pred_action = c3cache_reuse(latents_action, self._c3cache.residuals[step_index])
                     reused_steps += 1
-                elif c3cache_enabled and c3cache_start_step <= step_index <= c3cache_end_step:
+                elif cached_step and c3cache_method == "velocity_delta" and step_index > 0:
+                    pred_action = current_anchor + self._c3cache.residuals[step_index]
+                    reused_steps += 1
+                elif cached_step and c3cache_method in {"velocity", "velocity_virtual", "velocity_probe"}:
+                    pred_action = self._c3cache.residuals[step_index]
+                    if c3cache_method in {"velocity_virtual", "velocity_probe"}:
+                        pred_action = current_anchor + pred_action
+                    reused_steps += 1
+                elif c3cache_enabled and c3cache_method == "hidden" and c3cache_start_step <= step_index <= c3cache_end_step:
                     pred_action, residual = c3cache_refresh(
                         latents_action=latents_action,
                         timestep_action=timestep_action,
@@ -1320,7 +1445,8 @@ class FastWAM(torch.nn.Module):
                     )
                     # Compiled reduce-overhead outputs may be overwritten on graph
                     # replay, so persistent residuals always own their storage.
-                    staged_residuals[step_index] = residual.detach().clone()
+                    if reuse_reason != "reuse":
+                        staged_residuals[step_index] = residual.detach().clone()
                     full_steps += 1
                 else:
                     pred_action = denoise_action_with_video_cache(
@@ -1334,8 +1460,22 @@ class FastWAM(torch.nn.Module):
                     )
                     if c3cache_enabled:
                         full_steps += 1
+                if c3cache_enabled and c3cache_method != "hidden":
+                    if c3cache_method == "velocity_delta" and step_index == 0:
+                        current_anchor = pred_action.detach().clone()
+                        if reuse_reason != "reuse":
+                            staged_anchor = current_anchor.detach().clone()
+                    if reuse_reason != "reuse" and c3cache_start_step <= step_index <= c3cache_end_step:
+                        if c3cache_method == "velocity_delta":
+                            staged_residuals[step_index] = (pred_action - staged_anchor).detach().clone()
+                        elif c3cache_method in {"velocity_virtual", "velocity_probe"}:
+                            staged_residuals[step_index] = (pred_action - staged_anchor).detach().clone()
+                        elif c3cache_method == "velocity":
+                            staged_residuals[step_index] = pred_action.detach().clone()
 
                 latents_action = self.infer_action_scheduler.step(pred_action, step_delta_action, latents_action)
+                if c3cache_enabled and c3cache_method == "prefix" and reuse_reason != "reuse" and step_index == c3cache_end_step:
+                    staged_endpoint = latents_action.detach().clone()
 
             action_out = latents_action[0].detach().to(device="cpu", dtype=torch.float32)
         except Exception:
@@ -1343,7 +1483,12 @@ class FastWAM(torch.nn.Module):
                 self.reset_c3cache()
             raise
         if c3cache_enabled:
-            self._c3cache.commit(staged_residuals, full_steps, reused_steps)
+            self._c3cache.commit(
+                staged_residuals, full_steps, reused_steps,
+                anchor=staged_anchor, endpoint=staged_endpoint, reason=reuse_reason,
+                scheduler_skipped_steps=scheduler_skipped_steps,
+                probe_steps=probe_steps, probe_blocks=probe_blocks,
+            )
         return {"action": action_out}
 
     @torch.no_grad()

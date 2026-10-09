@@ -158,7 +158,12 @@ class C3CacheChecks(unittest.TestCase):
         )
         self.assertIn("c3cache_context_identity,", source)
         signature_body = source.split("c3cache_signature = (", 1)[1].split("timestep_video =", 1)[0]
-        self.assertNotIn("proprio", signature_body)
+        # The module identity can appear here; the current observation cannot.
+        signature_tree = ast.parse("c3cache_signature = (" + signature_body)
+        self.assertNotIn(
+            "proprio",
+            {node.id for node in ast.walk(signature_tree) if isinstance(node, ast.Name)},
+        )
         self.assertNotIn("_c3cache_tensor_digest(input_image)", signature_body)
 
     def test_refresh_and_reuse_arithmetic(self):

@@ -1,6 +1,6 @@
 # Velocity 缓存实验方案：定义纠正与三条实验线（2026-10-09）
 
-本文是当前优先执行的方案，更新 2026-10-07 研究方案中关于 velocity 的定义与实验顺序。本文整理实验，不表示下列新算法已实现，也不包含真实模型运行结果。
+本文是当前优先执行的方案，更新 2026-10-07 研究方案中关于 velocity 的定义与实验顺序。三条实验线的基础实现已接入，接口见第 7 节；本文不包含真实模型运行结果，研究假设尚待验证。
 
 ## 0. 纠正已有实现与结果归属
 
@@ -12,7 +12,7 @@ R_{\mathrm{proj},k}=H(h_{L,k})-H(h_{0,k})=W_hR_{h,k}.
 
 这属于 hidden residual 的输出投影，未实现用户希望研究的跨去噪 step 的 velocity 差值。将它当成该研究目标的实现是错误的。该公式本身在当前线性 head 下有数学意义，但不能替代下面的实验，也不能用它与 hidden 的性能相近来否定跨 step velocity 方案。
 
-2026-10-09 已按用户要求删除该旧实现及 `c3cache_residual_space` 配置。为保持旧实验可追溯，本文将已移除版本称为 `projected_hidden`（仅为历史标签，不是可用 CLI 值）。此前 97.25% 的结果若使用该开关，只能归入投影 residual 组；新方法需要独立的方法标识和实验结果。
+2026-10-09 已按用户要求删除该旧实现及 `c3cache_residual_space` 配置。为保持旧实验可追溯，本文将已移除版本称为 `projected_hidden`（仅为历史标签，不是可用 CLI 值）。此前 97.25% 的结果若使用该开关，只能归入投影 residual 组；新方法使用独立的 `c3cache_method` 标识，实验结果必须重新收集。
 
 ## 1. 统一符号、前提和要验证的假设
 
@@ -165,10 +165,11 @@ BF16 下原 hidden 的 h_0+(h_L−h_0) 与完整刷新 h_L 可能不同；直接
 
 ## 7. 代码状态与后续接口原则
 
-- 已实现：Full baseline、hidden residual（支持任意合法连续区间）。
-- 已删除：旧 projected_hidden 模式及 `c3cache_residual_space` 接口；当前没有可运行的 velocity 缓存模式。
-- 本文新提出但尚未实现：真实起点跨步 velocity 差值、直接 velocity 缓存、前缀终点、虚拟起点及便宜条件起点。
-- 后续实现使用明确且不冲突的方法标识；分开记录 residual 空间、起点来源、缓存区间和实际跳过步数，避免继续复用含混的 `velocity` 名字。
+- 已实现：Full baseline、hidden residual（支持任意合法连续区间），以及三条实验线的基础模式。
+- 已删除：旧 projected_hidden 模式及 `c3cache_residual_space` 接口。
+- 新接口 `c3cache_method`：`velocity_delta` 为真实首步的跨步累计差值；`velocity` 为直接 velocity；`prefix` 为前缀终点；`velocity_virtual` 为虚拟起点；`velocity_probe` 为前 m 层 action blocks 的条件起点。默认 `hidden`，默认缓存仍关闭。
+- `velocity_delta` 要求区间从 1 开始；其余新方法从 0 开始。浅层代理通过 `c3cache_probe_depth` 选择深度；学习型小校正器、自动 gate、离线真实轨迹误差采集及校准训练尚未实现。
+- 缓存方法、区间、完整/跳过调用和代理成本分开记录。新实验已经接入 LIBERO/RoboTwin 参数链；批量 LIBERO 脚本负责公平对照、配置留存及结果汇总。
 - 任何缓存对象切换、episode/任务切换、模型或 schedule 变化均应清空不兼容状态；简化前缀另校验初始噪声一致性。
 - 本地仅做源码、标准库假模型和轻量 dry run 检查；不加载真实模型、不安装依赖、不进行 GPU 评测。
 

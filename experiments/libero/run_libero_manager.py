@@ -1,6 +1,7 @@
 """Run original LIBERO tasks with one persistent model worker per GPU."""
 
 import os
+import json
 import shlex
 import shutil
 import subprocess
@@ -198,10 +199,10 @@ def run_evaluation(
             "--config-name",
             config_name,
             f"task={task_choice}",
-            f"ckpt={ckpt}",
+            f"ckpt={json.dumps(str(ckpt), ensure_ascii=False)}",
             f"gpu_id={gpu_id}",
             f"EVALUATION.num_trials={num_trials}",
-            f"EVALUATION.output_dir={output_dir}",
+            f"EVALUATION.output_dir={json.dumps(str(output_dir), ensure_ascii=False)}",
             *extra_overrides,
         ]
         log_handle = log_file.open("w", encoding="utf-8")
